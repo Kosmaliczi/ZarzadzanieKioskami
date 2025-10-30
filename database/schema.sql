@@ -29,7 +29,8 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('defaultFtpPath', '/');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('refreshInterval', '30000');
 
 -- Domyślne wartości dla danych logowania SSH (zostaną dodane tylko jeśli nie istnieją)
-INSERT OR IGNORE INTO settings (key, value) VALUES ('defaultSshUsername', 'kiosk');
+-- Użytkownik 'root' dla LibreELEC, 'kiosk' dla Debian
+INSERT OR IGNORE INTO settings (key, value) VALUES ('defaultSshUsername', 'root');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('defaultSshPort', '22');
 
 -- Tabela użytkowników

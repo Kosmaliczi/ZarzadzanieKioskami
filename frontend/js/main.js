@@ -156,6 +156,11 @@ function switchSection(sectionId) {
     // Dodaj klasę aktywną do wybranej sekcji i linku
     document.getElementById(sectionId).classList.add('active-section');
     document.querySelector(`nav ul li a[data-section="${sectionId}"]`).classList.add('active');
+
+    // Gdy wchodzimy do edytora, odśwież selektor kiosków
+    if (sectionId === 'text-editor') {
+        try { updateEditorKioskSelect(); } catch (e) {}
+    }
 }
 
 /**
@@ -430,8 +435,9 @@ function setupForms() {
             // Upewnij się, że kafelki kiosków są ukryte
             document.getElementById('ftp-kiosk-tiles').classList.add('hidden');
             
-            // Załaduj pliki
-            loadFtpFiles('/');
+            // Załaduj pliki - użyj domyślnej ścieżki w zależności od portu
+            const defaultPath = (parseInt(port) === 22) ? '/storage/videos' : '/';
+            loadFtpFiles(defaultPath);
 
             // Włącz przyciski edytora tekstu po nawiązaniu połączenia
             const loadTextBtn = document.getElementById('load-text');
@@ -921,31 +927,52 @@ async function handleDroppedFiles(files) {
  */
 function uploadDroppedFile(file) {
     return new Promise((resolve, reject) => {
-        // Odczytujemy plik jako base64
-        const reader = new FileReader();
+        if (!ftp.connection || !ftp.connection.hostname) {
+            reject(new Error('Brak aktywnego połączenia FTP/SFTP'));
+            return;
+        }
+
+        const path = ftp.currentPath || (ftp.connection.port == 22 ? '/storage/videos' : '/home/kiosk/MediaPionowe');
         
-        reader.onload = async function(event) {
-            try {
-                // Przesyłamy dane pliku wraz z danymi połączenia FTP
-                const result = await api.uploadFtpFile(
-                    ftp.connection,
-                    ftp.currentPath,
-                    event.target.result,
-                    file.name
-                );
-                
-                resolve(result);
-            } catch (error) {
-                reject(error);
+        console.log('Uploading dropped file:', file.name, 'Size:', file.size, 'to path:', path);
+
+        // Użyj FormData zamiast FileReader dla lepszej obsługi dużych plików
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('hostname', ftp.connection.hostname);
+        formData.append('port', ftp.connection.port);
+        formData.append('username', ftp.connection.username);
+        formData.append('password', ftp.connection.password);
+        formData.append('path', path);
+        formData.append('file_name', file.name);
+
+        // Użyj XMLHttpRequest dla progress tracking
+        const xhr = new XMLHttpRequest();
+        
+        xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+                const percentComplete = (e.loaded / e.total) * 100;
+                console.log(`Upload progress (${file.name}): ${percentComplete.toFixed(2)}%`);
             }
-        };
-        
-        reader.onerror = function(error) {
-            reject(new Error(`Nie można odczytać pliku: ${error}`));
-        };
-        
-        // Rozpocznij odczyt pliku jako URL danych (base64)
-        reader.readAsDataURL(file);
+        });
+
+        xhr.addEventListener('load', () => {
+            if (xhr.status === 200) {
+                const response = JSON.parse(xhr.responseText);
+                resolve(response);
+            } else {
+                const error = JSON.parse(xhr.responseText);
+                reject(new Error(error.error || 'Błąd podczas przesyłania pliku'));
+            }
+        });
+
+        xhr.addEventListener('error', () => {
+            reject(new Error('Błąd połączenia podczas przesyłania pliku'));
+        });
+
+        xhr.open('POST', `${api.baseUrl}/api/ftp/upload`);
+        xhr.setRequestHeader('Authorization', `Bearer ${api.getAuthToken()}`);
+        xhr.send(formData);
     });
 }
 
@@ -1274,42 +1301,64 @@ function updateSelectedFiles() {
 }
 
 function uploadFtpFile(file) {
-    // Pokaż powiadomienie o rozpoczęciu przesyłania
-    showToast(`Przesyłanie pliku ${file.name} do ${ftp.currentPath}...`, 'info');
+    console.log('uploadFtpFile called with:', file);
+    console.log('File name:', file ? file.name : 'NO FILE');
+    console.log('File size:', file ? file.size : 'NO FILE');
+    console.log('File type:', file ? file.type : 'NO FILE');
     
-    // Odczytujemy plik jako base64
-    const reader = new FileReader();
-    reader.onload = async function(event) {
+    if (!file) {
+        showToast('Nie wybrano pliku', 'error');
+        return;
+    }
+    
+    // Pokaż powiadomienie o rozpoczęciu przesyłania
+    showToast(`Przesyłanie pliku ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB) do ${ftp.currentPath}...`, 'info');
+    
+    // Użyj FormData zamiast base64 dla dużych plików
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('hostname', ftp.connection.hostname);
+    formData.append('port', ftp.connection.port);
+    formData.append('username', ftp.connection.username);
+    formData.append('password', ftp.connection.password);
+    formData.append('path', ftp.currentPath);
+    formData.append('file_name', file.name);
+    
+    // Wysyłamy przez XMLHttpRequest, aby śledzić postęp
+    const xhr = new XMLHttpRequest();
+    
+    xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+            const percentComplete = (e.loaded / e.total) * 100;
+            console.log(`Upload progress: ${percentComplete.toFixed(2)}%`);
+        }
+    });
+    
+    xhr.addEventListener('load', async () => {
         try {
-            // Przesyłamy dane pliku wraz z danymi połączenia FTP
-            const result = await api.uploadFtpFile(
-                ftp.connection,
-                ftp.currentPath,
-                event.target.result,
-                file.name
-            );
-            
-            // Wyświetl komunikat o sukcesie
-            showToast(`Plik ${file.name} został przesłany pomyślnie`, 'success');
-            
-            // Odśwież listę plików
-            loadFtpFiles(ftp.currentPath);
-            
-            // Dodaj informację o aktywności
-            addActivity(`Przesłano plik ${file.name} do ${ftp.currentPath} na kiosku ${selectedKiosk.name || selectedKiosk.id}`);
+            if (xhr.status === 200) {
+                const result = JSON.parse(xhr.responseText);
+                showToast(`Plik ${file.name} został przesłany pomyślnie`, 'success');
+                loadFtpFiles(ftp.currentPath);
+                addActivity(`Przesłano plik ${file.name} do ${ftp.currentPath} na kiosku ${selectedKiosk.name || selectedKiosk.id}`);
+            } else {
+                const error = JSON.parse(xhr.responseText);
+                throw new Error(error.error || 'Błąd przesyłania');
+            }
         } catch (error) {
             console.error('Błąd podczas przesyłania pliku:', error);
             showToast(`Błąd podczas przesyłania pliku: ${error.message}`, 'error');
         }
-    };
+    });
     
-    reader.onerror = function(error) {
-        console.error('Błąd odczytu pliku:', error);
-        showToast(`Nie można odczytać pliku: ${error}`, 'error');
-    };
+    xhr.addEventListener('error', () => {
+        console.error('Błąd sieci podczas przesyłania');
+        showToast('Błąd sieci podczas przesyłania pliku', 'error');
+    });
     
-    // Rozpocznij odczyt pliku jako URL danych (base64)
-    reader.readAsDataURL(file);
+    xhr.open('POST', `${api.baseUrl}/api/ftp/upload`);
+    xhr.setRequestHeader('Authorization', `Bearer ${api.getAuthToken()}`);
+    xhr.send(formData);
 }
 
 /**
@@ -1477,6 +1526,8 @@ async function refreshData() {
             // Jeśli tak, to aktualizujemy dane w pamięci bez odświeżania interfejsu
             kiosksData = response.kiosks;
             console.log("Odebrano odpowiedź z flagą no_refresh - pomijanie odświeżania UI");
+            // Zaktualizuj listę kiosków w edytorze
+            updateEditorKioskSelect();
             return;
         }
         
@@ -1487,6 +1538,8 @@ async function refreshData() {
         if (response.noRefresh) {
             kiosksData = newKiosksData;
             console.log("Odebrano odpowiedź z flagą noRefresh - pomijanie odświeżania UI");
+            // Zaktualizuj listę kiosków w edytorze
+            updateEditorKioskSelect();
             return;
         }
         
@@ -1503,9 +1556,92 @@ async function refreshData() {
             updateKiosksTableOnly();
             loadFtpKiosksOnly();
         }
+
+        // Zawsze aktualizuj selektor w edytorze
+        updateEditorKioskSelect();
     } catch (error) {
         console.error('Błąd podczas odświeżania danych:', error);
         showToast(`Błąd podczas odświeżania danych: ${error.message}`, 'error');
+    }
+}
+
+/**
+ * Aktualizuje listę kiosków w selektorze edytora.
+ * Pokazuje tylko realnie aktywne (online) kioski z przypisanym IP.
+ */
+async function updateEditorKioskSelect() {
+    const kioskSelect = document.getElementById('editor-kiosk-select');
+    if (!kioskSelect) return;
+    const onlyActiveToggle = document.getElementById('editor-kiosk-only-active');
+    const current = kioskSelect.value;
+    // Wyczyść i dodaj placeholder
+    kioskSelect.innerHTML = '<option value="" disabled selected>Wybierz kiosk...</option>';
+    try {
+        // Pobierz bazowe dane
+        let source = [];
+        if (Array.isArray(kiosksData) && kiosksData.length > 0) {
+            source = kiosksData;
+        } else {
+            const resp = await api.getKiosks();
+            source = Array.isArray(resp) ? resp : (resp && Array.isArray(resp.kiosks) ? resp.kiosks : []);
+        }
+
+        const norm = (k) => {
+            const status = (k.status || '').toString().toLowerCase();
+            const hasIp = !!(k.ip_address && String(k.ip_address).trim());
+            const onlineFlag = status === 'online' || k.online === true;
+            return { kiosk: k, onlineFlag, hasIp };
+        };
+
+        let list = source.map(norm);
+        // Filtr tylko aktywne, jeśli checkbox zaznaczony
+        const onlyActive = (!onlyActiveToggle || onlyActiveToggle.checked);
+        if (onlyActive) {
+            list = list.filter(x => x.onlineFlag && x.hasIp);
+        }
+
+        // Sortuj po nazwie
+        list.sort((a, b) => (a.kiosk.name || '').localeCompare(b.kiosk.name || ''));
+
+        const seen = new Set();
+        list.forEach(x => {
+            const kiosk = x.kiosk;
+            if (!kiosk || seen.has(kiosk.id)) return;
+            seen.add(kiosk.id);
+            const option = document.createElement('option');
+            option.value = String(kiosk.id);
+            const label = kiosk.name || `Kiosk ${kiosk.id}`;
+            const statusLabel = x.onlineFlag ? 'Online' : 'Offline';
+            const ipLabel = kiosk.ip_address ? `, ${kiosk.ip_address}` : (x.onlineFlag ? '' : '');
+            option.textContent = `${label} (${statusLabel}${ipLabel})`;
+            // Jeśli pokazujemy wszystkie, wyłącz wybór tylko dla kiosków BEZ IP.
+            // Pozwól wybierać offline z IP, bo FTP może być nadal dostępne.
+            if (!onlyActive && !x.hasIp) option.disabled = true;
+            kioskSelect.appendChild(option);
+        });
+
+        // Jeśli nic nie dodano, a filtr "tylko aktywne" był włączony, wyłącz filtr i pokaż wszystkie
+        if (kioskSelect.options.length === 1) {
+            if (onlyActiveToggle && onlyActiveToggle.checked) {
+                try { onlyActiveToggle.checked = false; } catch (_) {}
+                showToast('Brak aktywnych kiosków — pokazuję wszystkie.', 'warning');
+                // Rekurencyjnie przebuduj listę już bez filtra
+                return updateEditorKioskSelect();
+            } else {
+                const opt = document.createElement('option');
+                opt.disabled = true;
+                opt.textContent = 'Brak kiosków';
+                kioskSelect.appendChild(opt);
+            }
+        }
+
+        if (current) kioskSelect.value = current;
+    } catch (e) {
+        console.error('Błąd podczas odświeżania listy kiosków edytora:', e);
+        const opt = document.createElement('option');
+        opt.disabled = true;
+        opt.textContent = 'Błąd ładowania listy kiosków';
+        kioskSelect.appendChild(opt);
     }
 }
 
@@ -1949,6 +2085,9 @@ function loadSettingsToForms() {
    document.getElementById('setting-ftp-username').value = CONFIG.defaultFtpUsername || '';
    document.getElementById('setting-ftp-password').value = CONFIG.defaultFtpPassword || '';
    
+   // Ustawienia SSH
+   document.getElementById('setting-ssh-username').value = CONFIG.defaultSshUsername || 'root';
+   
    // Inicjalizacja pola portu FTP w formularzu połączenia
    document.getElementById('ftp-port').value = CONFIG.defaultFtpPort || 21;
    
@@ -1983,8 +2122,8 @@ function connectSSH(kiosk) {
    // Domyślny port SSH
    const sshPort = CONFIG.defaultSshPort || 22;
    
-   // Używamy nazwy użytkownika zapisanej w konfiguracji lub domyślnie 'kiosk'
-   const sshUsername = CONFIG.defaultSshUsername || 'kiosk';
+    // Preferuj nazwę użytkownika z kiosku (ftp_username), w przeciwnym razie z konfiguracji lub 'root'
+    const sshUsername = (kiosk.ftp_username && kiosk.ftp_username.trim()) || CONFIG.defaultSshUsername || 'root';
    
    // Pokaż informacje o połączeniu
    console.log(`Łączenie przez SSH z ${kiosk.ip_address} jako użytkownik ${sshUsername}`);
@@ -2012,28 +2151,41 @@ function connectSSH(kiosk) {
  * @param {object} kiosk - obiekt kiosku
  */
 function connectVNC(kiosk) {
-   if (!kiosk.ip_address) {
-       showToast('Brak adresu IP dla tego kiosku', 'error');
-       return;
-   }
-   
-   // Stały port VNC - 6080
-   const vncPort = 6080;
-   
-   // Tworzymy URL dla połączenia NoVNC - używamy strony lokalnej zamiast serwera
-   // Korzystamy bezpośrednio z adresu IP kiosku i portu VNC
-   const vncUrl = `http://${kiosk.ip_address}:${vncPort}/vnc.html?host=${kiosk.ip_address}&port=${vncPort}&autoconnect=true`;
-   
-   try {
-       // Otwórz stronę VNC w nowej karcie
-       window.open(vncUrl, '_blank');
-       
-       // Dodaj informację o aktywności
-       addActivity(`Zainicjowano połączenie VNC z kioskiem: ${kiosk.name || kiosk.id}`);
-   } catch (error) {
-       console.error('Błąd podczas inicjowania połączenia VNC:', error);
-       showToast(`Błąd połączenia VNC: ${error.message}`, 'error');
-   }
+    if (!kiosk.ip_address) {
+        showToast('Brak adresu IP dla tego kiosku', 'error');
+        return;
+    }
+
+    // Dialog wyboru metody połączenia
+    const choice = window.prompt(
+        'Wybierz metodę połączenia:\n1 - Połącz przez VNC (NoVNC)\n2 - Połącz przez webowy interfejs Kodi (port 8080)',
+        '1'
+    );
+    if (!choice) return;
+
+    if (choice === '2') {
+        // Webowy interfejs Kodi (domyślnie port 8080)
+        const kodiUrl = `http://${kiosk.ip_address}:8080/`;
+        try {
+            window.open(kodiUrl, '_blank');
+            addActivity(`Zainicjowano połączenie z webowym interfejsem Kodi: ${kiosk.name || kiosk.id}`);
+        } catch (error) {
+            console.error('Błąd podczas otwierania webowego interfejsu Kodi:', error);
+            showToast(`Błąd połączenia z webowym interfejsem Kodi: ${error.message}`, 'error');
+        }
+        return;
+    }
+
+    // Domyślnie VNC (NoVNC)
+    const vncPort = 6080;
+    const vncUrl = `http://${kiosk.ip_address}:${vncPort}/vnc.html?host=${kiosk.ip_address}&port=${vncPort}&autoconnect=true`;
+    try {
+        window.open(vncUrl, '_blank');
+        addActivity(`Zainicjowano połączenie VNC z kioskiem: ${kiosk.name || kiosk.id}`);
+    } catch (error) {
+        console.error('Błąd podczas inicjowania połączenia VNC:', error);
+        showToast(`Błąd połączenia VNC: ${error.message}`, 'error');
+    }
 }
 
 // Automatyczne odświeżanie listy kiosków co 30 sekund, gdy użytkownik jest w sekcji "kiosks"
@@ -2061,30 +2213,33 @@ async function restartKioskService(kiosk) {
         // Pobierz nazwę usługi z ustawień
         const serviceName = 'kiosk';
         
-        // Pobierz nazwę użytkownika SSH z ustawień
-        let username;
+        // Pobierz nazwę użytkownika SSH: preferuj ftp_username kiosku, potem ustawienia, potem 'root'
+        let username = (kiosk.ftp_username && kiosk.ftp_username.trim()) || settings.defaultSshUsername || 'root';
+        console.log('Wybrana nazwa użytkownika SSH:', username);
         
-        if (settings.defaultSshUsername) {
-            username = settings.defaultSshUsername;
-            console.log('Pobrano nazwę użytkownika SSH z bazy danych');
-        } else {
-            username = 'kiosk'; // domyślna nazwa użytkownika
-            console.log('Użyto domyślnej nazwy użytkownika SSH');
+        // Zapytaj o hasło SSH
+        const password = prompt(`Podaj hasło SSH dla użytkownika ${username} na kiosku ${kiosk.name || kiosk.ip_address}:`);
+        
+        if (!password) {
+            showToast('Anulowano restart - nie podano hasła', 'info');
+            return;
         }
-          // Pokaż komunikat o trwającym restarcie
-        showToast(`Trwa restart usługi ${serviceName} na kiosku ${kiosk.name || kiosk.id} (używam uwierzytelniania kluczem SSH)...`, 'info');
         
-        // Przekaż tylko nazwę użytkownika do API - autentykacja odbędzie się przez klucz SSH
+        // Pokaż komunikat o trwającym restarcie
+        showToast(`Trwa restart usługi na kiosku ${kiosk.name || kiosk.id}...`, 'info');
+        
+        // Przekaż nazwę użytkownika i hasło do API
         const result = await api.restartKioskService(kiosk.id, {
             username: username,
+            password: password,
             service: serviceName
         });
         
         // Pokaż komunikat o sukcesie
-        showToast(`Usługa ${serviceName} została pomyślnie zrestartowana na kiosku ${kiosk.name || kiosk.id}`, 'success');
+        showToast(result.message || `Usługa została pomyślnie zrestartowana`, 'success');
         
         // Dodaj informację o aktywności
-        addActivity(`Zrestartowano usługę ${serviceName} na kiosku ${kiosk.name || kiosk.id}`);
+        addActivity(`Zrestartowano usługę na kiosku ${kiosk.name || kiosk.id}`);
     } catch (error) {
         console.error('Błąd podczas restartowania usługi:', error);
         showToast(`Błąd podczas restartowania usługi: ${error.message || 'Nieznany błąd'}`, 'error');
@@ -2100,14 +2255,136 @@ function setupTextEditorUI() {
     const saveBtn = document.getElementById('save-text');
     const pathInput = document.getElementById('text-file-path');
     const editor = document.getElementById('text-editor-area');
+    const kioskSelect = document.getElementById('editor-kiosk-select');
+    // Status przenosimy do tooltipów/toastów i ewentualnie placeholdera (brak elementu statusu w nowym UI)
 
     if (!loadBtn || !saveBtn || !pathInput || !editor) return;
+
+    // Domyślnie zablokuj przyciski do czasu połączenia
+    try {
+        loadBtn.disabled = true;
+        saveBtn.disabled = true;
+    } catch (_) {}
+
+    // Uzupełnij listę kiosków teraz (pierwsze wejście) i później będzie odświeżana przez refreshData
+    updateEditorKioskSelect();
+
+    // Gdy lista w playliście się zaktualizuje, odśwież też listę w edytorze
+    try {
+        document.addEventListener('kiosks-list-updated', () => {
+            // Odtwórz listę wyłącznie na podstawie aktualnych danych, zgodnie z regułą "tylko podłączone"
+            updateEditorKioskSelect();
+        });
+    } catch (_) {}
+
+    // Zdarzenie przełącznika "Tylko aktywne"
+    try {
+        const onlyActiveToggle = document.getElementById('editor-kiosk-only-active');
+        if (onlyActiveToggle) {
+            onlyActiveToggle.addEventListener('change', () => {
+                updateEditorKioskSelect();
+            });
+        }
+    } catch (_) {}
+
+    // Przycisk Odśwież listę kiosków (wymusza reload z API)
+    try {
+        const refreshBtn = document.getElementById('editor-refresh-kiosks');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', async () => {
+                try {
+                    const resp = await api.getKiosks();
+                    kiosksData = Array.isArray(resp) ? resp : (resp && Array.isArray(resp.kiosks) ? resp.kiosks : []);
+                } catch (e) {
+                    console.warn('Nie udało się pobrać kiosków podczas odświeżenia:', e);
+                } finally {
+                    updateEditorKioskSelect();
+                }
+            });
+        }
+    } catch (_) {}
+
+    // Helper: połącz z wybranym kioskiem (używany przez select change i przycisk Połącz)
+    // Dokładnie tak samo jak handleKioskSelection w playlist.js
+    async function connectSelectedKiosk() {
+        const kioskId = kioskSelect && kioskSelect.value ? kioskSelect.value : null;
+        if (!kioskId) {
+            showToast('Najpierw wybierz kiosk.', 'warning');
+            return;
+        }
+
+        try {
+            // Pobierz dane kiosku (tak jak w playlist)
+            const kiosks = await api.getKiosks();
+            const currentKiosk = kiosks.find(k => k.id.toString() === kioskId.toString());
+            
+            if (!currentKiosk) {
+                showToast('Nie znaleziono wybranego kiosku', 'error');
+                return;
+            }
+            
+            if (!currentKiosk.ip_address) {
+                showToast('Wybrany kiosk nie ma przypisanego adresu IP', 'error');
+                return;
+            }
+            
+            // Pobierz dane logowania FTP dla kiosku (identycznie jak playlist)
+            const ftpCredentials = await api.getKioskFtpCredentials(kioskId);
+            
+            // Pobierz ustawienia, aby określić domyślny port (SFTP=22 dla LibreELEC, FTP=21 dla Debian)
+            const settings = await api.getSettings();
+            console.log('Settings from API:', settings);
+            
+            // LibreELEC używa SFTP (port 22), nie FTP (port 21)
+            // Domyślnie zakładamy SFTP dla wszystkich kiosków, chyba że ustawienia mówią inaczej
+            let defaultPort = 22; // Domyślnie SFTP dla LibreELEC
+            if (settings.defaultFtpPort) {
+                defaultPort = parseInt(settings.defaultFtpPort);
+            }
+            console.log('Using FTP/SFTP port:', defaultPort);
+            
+            // Ustaw dane połączenia FTP/SFTP (obsługa różnych nazw pól - identycznie jak playlist)
+            ftp.connection = {
+                hostname: currentKiosk.ip_address,
+                port: defaultPort,
+                username: (ftpCredentials && (ftpCredentials.username || ftpCredentials.ftp_username)) || (defaultPort === 22 ? 'root' : 'kiosk'),
+                password: (ftpCredentials && (ftpCredentials.password || ftpCredentials.ftp_password)) || ''
+            };
+            
+            console.log('Editor FTP connection:', { ...ftp.connection, password: '***' });
+            
+            ftp.currentPath = '/';
+            ftp.pathHistory = ['/'];
+            selectedKiosk = currentKiosk;
+
+            // Odblokuj przyciski
+            if (loadBtn) loadBtn.disabled = false;
+            if (saveBtn) saveBtn.disabled = false;
+
+            showToast(`Połączono z kioskiem ${currentKiosk.name || currentKiosk.id}`, 'success');
+        } catch (error) {
+            console.error('Błąd podczas łączenia z kioskiem:', error);
+            showToast(`Nie udało się połączyć z kioskiem: ${error.message}`, 'error');
+        }
+    }
+
+    // Przycisk Połącz
+    try {
+        const connectBtn = document.getElementById('editor-connect-btn');
+        if (connectBtn) {
+            connectBtn.addEventListener('click', connectSelectedKiosk);
+        }
+    } catch (_) {}
+
+    // Auto-połączenie: po zmianie wyboru w selektorze łączymy z FTP tego kiosku
+    if (kioskSelect) {
+        kioskSelect.addEventListener('change', connectSelectedKiosk);
+    }
 
     // Wczytaj zawartość pliku
     loadBtn.addEventListener('click', async () => {
         if (!ftp.connection) {
-            showToast('Najpierw połącz się z serwerem FTP w sekcji FTP.', 'warning');
-            switchSection('ftp');
+            showToast('Najpierw wybierz kiosk, aby połączyć z FTP.', 'warning');
             return;
         }
         const path = pathInput.value?.trim();
@@ -2129,8 +2406,7 @@ function setupTextEditorUI() {
     // Zapisz zawartość pliku
     saveBtn.addEventListener('click', async () => {
         if (!ftp.connection) {
-            showToast('Najpierw połącz się z serwerem FTP w sekcji FTP.', 'warning');
-            switchSection('ftp');
+            showToast('Najpierw wybierz kiosk, aby połączyć z FTP.', 'warning');
             return;
         }
         const path = pathInput.value?.trim();

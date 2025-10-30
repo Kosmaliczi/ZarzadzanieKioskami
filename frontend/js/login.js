@@ -11,7 +11,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Funkcja do weryfikacji logowania poprzez API
     async function verifyLogin(username, password) {
         try {
-            const response = await fetch('http://192.168.0.105:5000/api/auth/login', {
+            const response = await fetch('http://10.0.0.163:5000/api/auth/login', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

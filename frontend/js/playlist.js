@@ -32,7 +32,8 @@ function setupPlaylistUI() {
  */
 async function updatePlaylistKioskSelector() {
     try {
-        const kiosks = await api.getKiosks();
+        const resp = await api.getKiosks();
+        const kiosks = Array.isArray(resp) ? resp : (resp && Array.isArray(resp.kiosks) ? resp.kiosks : []);
         const kioskSelect = document.getElementById('playlist-kiosk-select');
         
         // Wyczyść istniejące opcje, pozostawiając tylko placeholder
@@ -49,6 +50,9 @@ async function updatePlaylistKioskSelector() {
             }
             kioskSelect.appendChild(option);
         });
+
+        // Powiadom inne moduły, że lista kiosków została zaktualizowana
+        try { document.dispatchEvent(new CustomEvent('kiosks-list-updated')); } catch (_) {}
     } catch (error) {
         console.error('Błąd podczas pobierania listy kiosków:', error);
         showToast('Nie udało się pobrać listy kiosków', 'error');
@@ -82,14 +86,14 @@ async function handleKioskSelection(event) {
         playlistFtp.currentKiosk = currentKiosk;
         
         // Pobierz dane logowania FTP dla kiosku
-        const ftpCredentials = await api.getKioskFtpCredentials(kioskId);
-          // Ustaw dane połączenia FTP
-        playlistFtp.connection = {
-            hostname: currentKiosk.ip_address,
-            port: 21, // Domyślny port FTP
-            username: ftpCredentials.username || 'kiosk',
-            password: ftpCredentials.password || 'kiosk'
-        };
+                const ftpCredentials = await api.getKioskFtpCredentials(kioskId);
+                // Ustaw dane połączenia FTP (obsługa różnych nazw pól)
+                playlistFtp.connection = {
+                        hostname: currentKiosk.ip_address,
+                        port: 21, // Domyślny port FTP
+                        username: (ftpCredentials && (ftpCredentials.username || ftpCredentials.ftp_username)) || 'kiosk',
+                        password: (ftpCredentials && (ftpCredentials.password || ftpCredentials.ftp_password)) || 'kiosk'
+                };
         
         // Załaduj pliki
         await loadPlaylistFiles();

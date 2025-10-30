@@ -10,6 +10,7 @@ import base64
 import jwt
 import bcrypt
 from functools import wraps
+from sftp_handler import SFTPHandler, sftp_connect
 
 # Ładowanie zmiennych środowiskowych
 load_dotenv()
@@ -156,7 +157,21 @@ def init_default_user():
 # Inicjalizacja domyślnego użytkownika przy starcie
 init_default_user()
 
-# Obsługa FTP
+# Ścieżka do klucza SSH dla SFTP (LibreELEC)
+SSH_KEY_PATH = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa')
+
+# Funkcja określająca protokół na podstawie portu
+def get_protocol(port):
+    """
+    Określa protokół na podstawie numeru portu
+    Args:
+        port: Numer portu (21 dla FTP, 22 dla SFTP)
+    Returns:
+        'ftp' lub 'sftp'
+    """
+    return 'sftp' if port == 22 else 'ftp'
+
+# Obsługa FTP (tradycyjny vsftpd)
 def ftp_connect(hostname, username, password, port=21):
     try:
         ftp = ftplib.FTP()
@@ -166,6 +181,31 @@ def ftp_connect(hostname, username, password, port=21):
     except Exception as e:
         print(f"FTP connection error: {e}")
         return None
+
+# Uniwersalna funkcja do łączenia (FTP lub SFTP)
+def connect_file_transfer(hostname, username, password, port=21):
+    """
+    Uniwersalna funkcja łącząca z serwerem plików
+    Automatycznie wybiera FTP (port 21) lub SFTP (port 22)
+    
+    Args:
+        hostname: Adres IP kiosku
+        username: Nazwa użytkownika (LibreELEC: root)
+        password: Hasło
+        port: Port (21=FTP, 22=SFTP)
+    
+    Returns:
+        Obiekt FTP/SFTP lub None w przypadku błędu
+    """
+    protocol = get_protocol(port)
+    
+    if protocol == 'sftp':
+        # LibreELEC - używamy SFTP z hasłem (nie kluczem SSH)
+        # Klucze SSH są używane tylko do komend SSH, nie do SFTP
+        return sftp_connect(hostname, username, password, port)
+    else:
+        # Tradycyjny FTP (vsftpd)
+        return ftp_connect(hostname, username, password, port)
 
 # Nowa funkcja do tworzenia katalogów FTP
 def ftp_create_directory(ftp, path):
@@ -191,48 +231,80 @@ def ftp_delete_file(ftp, path, is_directory=False):
         return False
 
 # Nowa funkcja do pobierania zawartości pliku
-def ftp_get_file_content(ftp, path):
+def ftp_get_file_content(ftp, path, encoding: str = 'utf-8'):
+    """Pobiera zawartość pliku jako tekst w UTF-8.
+
+    Zwraca tekst jeśli plik jest poprawnym UTF-8. Rzuca UnicodeDecodeError
+    gdy zawartość nie jest poprawnym UTF-8. Inne wyjątki są logowane i
+    funkcja zwraca None.
+    """
+    temp_file_path = None
     try:
         # Utwórz tymczasowy plik do pobrania zawartości
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             # Pobierz plik z FTP
             ftp.retrbinary(f'RETR {path}', temp_file.write)
             temp_file_path = temp_file.name
-        
-        # Odczytaj zawartość pobranego pliku
-        with open(temp_file_path, 'r') as file:
+
+        # Odczytaj zawartość pobranego pliku w UTF-8
+        with open(temp_file_path, 'r', encoding=encoding, errors='strict') as file:
             content = file.read()
-        
-        # Usuń tymczasowy plik
-        os.unlink(temp_file_path)
-        
+
         return content
+    except UnicodeDecodeError as e:
+        # Plik nie jest w UTF-8 – propaguj błąd, aby API mogło zwrócić czytelny komunikat
+        print(f"FTP get file content error (not UTF-8): {e}")
+        raise
     except Exception as e:
         print(f"FTP get file content error: {e}")
         return None
+    finally:
+        # Usuń tymczasowy plik
+        try:
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+        except Exception:
+            pass
 
 # Nowa funkcja do zapisu zawartości pliku
-def ftp_put_file_content(ftp, path, content):
+def ftp_put_file_content(ftp, path, content, encoding: str = 'utf-8'):
+    """Zapisuje zawartość tekstową jako plik w kodowaniu UTF-8 na serwerze FTP."""
+    temp_file_path = None
     try:
-        # Utwórz tymczasowy plik z zawartością
-        with tempfile.NamedTemporaryFile(delete=False, mode='w') as temp_file:
+        # Utwórz tymczasowy plik z zawartością w UTF-8
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', encoding=encoding, newline='') as temp_file:
             temp_file.write(content)
             temp_file_path = temp_file.name
-        
+
         # Wyślij plik do FTP
         with open(temp_file_path, 'rb') as file:
             ftp.storbinary(f'STOR {path}', file)
-        
-        # Usuń tymczasowy plik
-        os.unlink(temp_file_path)
-        
+
         return True
     except Exception as e:
         print(f"FTP put file content error: {e}")
         return False
+    finally:
+        # Usuń tymczasowy plik
+        try:
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+        except Exception:
+            pass
 
 # Endpointy API
 
+@app.route('/api/ticker-text')
+def ticker_text():
+    """
+    UWAGA: Ten endpoint nie jest używany w obecnej implementacji.
+    Addon Kodi pobiera plik /storage/napis.txt bezpośrednio z lokalnego systemu plików,
+    nie przez HTTP API.
+    
+    Jeśli chcesz używać tego endpointu, musisz skonfigurować połączenie FTP
+    do konkretnego kiosku i pobrać zawartość pliku przez FTP.
+    """
+    return "Addon Kodi pobiera plik lokalnie z /storage/napis.txt", 200, {'Content-Type': 'text/plain'}
 
 @app.route('/api/settings', methods=['GET'])
 @token_required
@@ -279,7 +351,7 @@ def get_kiosks():
     # możemy to wykryć na podstawie nagłówków lub źródła żądania
     if 'Kiosk-Device' in user_agent or '/api/device/' in referer:
         # Zwróć minimalną odpowiedź (tylko podstawowe dane)
-    # ...istniejący kod logowania poprawiony wyżej...
+        conn = get_db_connection()
         kiosks = conn.execute('SELECT id, name, serial_number, ip_address, status FROM kiosks').fetchall()
         conn.close()
         
@@ -448,7 +520,7 @@ def test_ftp_connection():
     data = request.json
     
     if not data or 'hostname' not in data or 'username' not in data or 'password' not in data:
-        return jsonify({"error": "Brakujące dane połączenia FTP"}), 400
+        return jsonify({"error": "Brakujące dane połączenia"}), 400
     
     # Konwersja portu na int
     port = 21
@@ -458,13 +530,17 @@ def test_ftp_connection():
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
     
-    if ftp:
-        ftp.quit()
-        return jsonify({"message": "Połączenie FTP udane"})
+    if conn:
+        if isinstance(conn, SFTPHandler):
+            conn.close()
+        else:
+            conn.quit()
+        return jsonify({"message": f"Połączenie {protocol.upper()} udane"})
     else:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
 
 @app.route('/api/ftp/files', methods=['POST'])
 @token_required
@@ -472,11 +548,10 @@ def list_ftp_files():
     data = request.json
     
     if not data or 'hostname' not in data or 'username' not in data or 'password' not in data:
-        return jsonify({"error": "Brakujące dane połączenia FTP"}), 400
+        return jsonify({"error": "Brakujące dane połączenia"}), 400
     
-    remote_path = data.get('path', '/home/kiosk/MediaPionowe')
-    
-    # Konwersja portu na int
+    # Domyślna ścieżka dla LibreELEC SFTP to /storage/videos
+    # Dla Debian/vsftpd FTP to /home/kiosk/MediaPionowe
     port = 21
     if 'port' in data:
         try:
@@ -484,67 +559,96 @@ def list_ftp_files():
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
+    # Automatyczne określanie domyślnej ścieżki w zależności od protokołu
+    default_path = '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe'
+    remote_path = data.get('path', default_path)
     
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
+    
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
-        # Zmieniamy katalog na podany
-        ftp.cwd(remote_path)
-        
-        # Pobieramy listę plików i katalogów
-        files = []
-        ftp.dir(lambda line: files.append(line))
-        
         file_info = []
-        for line in files:
-            # Parsujemy dane z formatu DIR - typowy format Unix
-            parts = line.split(None, 8)
-            if len(parts) < 9:
-                continue
-                
-            permissions = parts[0]
-            size = parts[4]
-            date_str = f"{parts[5]} {parts[6]} {parts[7]}"
-            name = parts[8]
+        
+        if isinstance(conn, SFTPHandler):
+            # SFTP - LibreELEC
+            files = conn.list_directory(remote_path)
+            for file_data in files:
+                full_path = os.path.join(remote_path, file_data['name']).replace('\\', '/')
+                file_info.append({
+                    "name": file_data['name'],
+                    "size": file_data['size'],
+                    "path": full_path,
+                    "isDirectory": file_data['is_directory'],
+                    "modified": datetime.datetime.fromtimestamp(file_data['modified']).strftime('%Y-%m-%d %H:%M:%S'),
+                    "permissions": file_data['permissions']
+                })
+        else:
+            # FTP tradycyjny
+            # Zmieniamy katalog na podany
+            conn.cwd(remote_path)
             
-            # Sprawdzanie, czy to katalog (pierwszy znak permissions to 'd')
-            is_dir = permissions.startswith('d')
+            # Pobieramy listę plików i katalogów
+            files = []
+            conn.dir(lambda line: files.append(line))
             
-            try:
-                # Próba przekształcenia rozmiaru na liczbę
-                size_num = int(size)
-            except ValueError:
-                size_num = 0
+            for line in files:
+                # Parsujemy dane z formatu DIR - typowy format Unix
+                parts = line.split(None, 8)
+                if len(parts) < 9:
+                    continue
+                    
+                permissions = parts[0]
+                size = parts[4]
+                date_str = f"{parts[5]} {parts[6]} {parts[7]}"
+                name = parts[8]
                 
-            # Tworzenie ścieżki
-            full_path = os.path.join(remote_path, name)
+                # Sprawdzanie, czy to katalog (pierwszy znak permissions to 'd')
+                is_dir = permissions.startswith('d')
                 
-            # Formatowanie daty modyfikacji
-            try:
-                if ':' in parts[7]:  # Format "Oct 14 13:45" (rok bieżący)
-                    current_year = datetime.datetime.now().year
-                    mod_date = datetime.datetime.strptime(f"{date_str} {current_year}", "%b %d %H:%M %Y")
-                else:  # Format "Oct 14 2022" (rok podany)
-                    mod_date = datetime.datetime.strptime(date_str, "%b %d %Y")
-                modified = mod_date.strftime('%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                modified = "Nieznana data"
-                
-            file_info.append({
-                "name": name,
-                "path": full_path,
-                "is_directory": is_dir,
-                "size": size_num,
-                "modified": modified
-            })
-                
-        ftp.quit()
+                try:
+                    # Próba przekształcenia rozmiaru na liczbę
+                    size_num = int(size)
+                except ValueError:
+                    size_num = 0
+                    
+                # Tworzenie ścieżki
+                full_path = os.path.join(remote_path, name)
+                    
+                # Formatowanie daty modyfikacji
+                try:
+                    if ':' in parts[7]:  # Format "Oct 14 13:45" (rok bieżący)
+                        current_year = datetime.datetime.now().year
+                        mod_date = datetime.datetime.strptime(f"{date_str} {current_year}", "%b %d %H:%M %Y")
+                    else:  # Format "Oct 14 2022" (rok podany)
+                        mod_date = datetime.datetime.strptime(date_str, "%b %d %Y")
+                    modified = mod_date.strftime('%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    modified = "Nieznana data"
+                    
+                file_info.append({
+                    "name": name,
+                    "path": full_path,
+                    "is_directory": is_dir,
+                    "size": size_num,
+                    "modified": modified
+                })
+        
+        # Zamykanie połączenia
+        if isinstance(conn, SFTPHandler):
+            conn.close()
+        else:
+            conn.quit()
+        
         return jsonify(file_info)
     except Exception as e:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
         return jsonify({"error": f"Błąd podczas listowania plików: {str(e)}"}), 500
@@ -552,73 +656,155 @@ def list_ftp_files():
 @app.route('/api/ftp/upload', methods=['POST'])
 @token_required
 def upload_ftp_file():
-    data = request.json
-    
-    if not data or 'hostname' not in data or 'username' not in data or 'password' not in data or 'file_data' not in data:
-        return jsonify({"error": "Brakujące dane do przesłania pliku"}), 400
-    
-    remote_path = data.get('path', '/home/kiosk/MediaPionowe')
-    file_name = data.get('file_name')
-    file_data = data.get('file_data')
-    
-    if not file_name or not file_data:
-        return jsonify({"error": "Brak nazwy pliku lub danych pliku"}), 400
-    
-    # Konwersja portu na int
-    port = 21
-    if 'port' in data:
+    # Sprawdź, czy to FormData czy JSON
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        # FormData - dla dużych plików
+        data = request.form
+        file = request.files.get('file')
+        
+        if not file:
+            return jsonify({"error": "Brak pliku do przesłania"}), 400
+        
+        hostname = data.get('hostname')
+        username = data.get('username')
+        password = data.get('password')
+        port = int(data.get('port', 21))
+        remote_path = data.get('path', '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe')
+        file_name = data.get('file_name') or file.filename
+        
+        print(f"Upload (FormData) - file: {file_name}, size: {file.content_length}, path: {remote_path}, port: {port}")
+        
+        # Połączenie z serwerem (FTP lub SFTP)
+        protocol = get_protocol(port)
+        conn = connect_file_transfer(hostname, username, password, port)
+        
+        if not conn:
+            return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
+        
         try:
-            port = int(data['port'])
-        except (ValueError, TypeError):
-            return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
-    
-    # Dekodowanie danych pliku z base64
-    try:
-        # Usunięcie nagłówka 'data:...' jeśli istnieje
-        if ';base64,' in file_data:
-            file_data = file_data.split(';base64,')[1]
-        
-        file_bytes = base64.b64decode(file_data)
-    except Exception as e:
-        return jsonify({"error": f"Błąd dekodowania danych pliku: {str(e)}"}), 400
-    
-    # Połączenie z serwerem FTP
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
-    
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
-    
-    try:
-        # Zmieniamy katalog na podany
-        ftp.cwd(remote_path)
-        
-        # Tworzenie tymczasowego pliku lokalnego
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(file_bytes)
-            temp_file_path = temp_file.name
-        
-        # Przesyłanie pliku
-        with open(temp_file_path, 'rb') as file:
-            ftp.storbinary(f'STOR {file_name}', file)
-        
-        # Usunięcie tymczasowego pliku
-        os.remove(temp_file_path)
-        
-        ftp.quit()
-        return jsonify({"message": f"Plik {file_name} został pomyślnie przesłany"})
-    except Exception as e:
-        try:
-            ftp.quit()
-        except:
-            pass
-        
-        # Próba usunięcia tymczasowego pliku
-        try:
-            os.remove(temp_file_path)
-        except:
-            pass
+            # Zapisz plik tymczasowo
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                file.save(temp_file.name)
+                temp_file_path = temp_file.name
             
-        return jsonify({"error": f"Błąd podczas przesyłania pliku: {str(e)}"}), 500
+            if isinstance(conn, SFTPHandler):
+                # SFTP - LibreELEC
+                full_path = os.path.join(remote_path, file_name).replace('\\', '/')
+                conn.upload_file(temp_file_path, full_path)
+                conn.close()
+            else:
+                # FTP tradycyjny
+                conn.cwd(remote_path)
+                with open(temp_file_path, 'rb') as f:
+                    conn.storbinary(f'STOR {file_name}', f)
+                conn.quit()
+            
+            # Usuń plik tymczasowy
+            os.remove(temp_file_path)
+            
+            return jsonify({"message": f"Plik {file_name} został pomyślnie przesłany"})
+        except Exception as e:
+            try:
+                if isinstance(conn, SFTPHandler):
+                    conn.close()
+                else:
+                    conn.quit()
+            except:
+                pass
+            
+            try:
+                if 'temp_file_path' in locals():
+                    os.remove(temp_file_path)
+            except:
+                pass
+            
+            return jsonify({"error": f"Błąd podczas przesyłania pliku: {str(e)}"}), 500
+    else:
+        # JSON - dla małych plików (backward compatibility)
+        data = request.json
+        
+        # Debug - wypisz otrzymane klucze
+        print(f"Upload request received with keys: {data.keys() if data else 'None'}")
+        
+        if not data or 'hostname' not in data or 'username' not in data or 'password' not in data or 'file_data' not in data:
+            print(f"Missing data - hostname: {'hostname' in data if data else False}, username: {'username' in data if data else False}, password: {'password' in data if data else False}, file_data: {'file_data' in data if data else False}")
+            return jsonify({"error": "Brakujące dane do przesłania pliku"}), 400
+        
+        # Domyślna ścieżka w zależności od portu
+        port = 21
+        if 'port' in data:
+            try:
+                port = int(data['port'])
+            except (ValueError, TypeError):
+                return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
+        
+        default_path = '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe'
+        remote_path = data.get('path', default_path)
+        file_name = data.get('file_name')
+        file_data = data.get('file_data')
+        
+        print(f"Upload details - file_name: {file_name}, path: {remote_path}, port: {port}")
+        
+        if not file_name or not file_data:
+            print(f"Missing file details - file_name: {bool(file_name)}, file_data length: {len(file_data) if file_data else 0}")
+            return jsonify({"error": "Brak nazwy pliku lub danych pliku"}), 400
+        
+        # Dekodowanie danych pliku z base64
+        try:
+            # Usunięcie nagłówka 'data:...' jeśli istnieje
+            if ';base64,' in file_data:
+                file_data = file_data.split(';base64,')[1]
+            
+            file_bytes = base64.b64decode(file_data)
+        except Exception as e:
+            return jsonify({"error": f"Błąd dekodowania danych pliku: {str(e)}"}), 400
+        
+        # Połączenie z serwerem (FTP lub SFTP)
+        protocol = get_protocol(port)
+        conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
+        
+        if not conn:
+            return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
+        
+        try:
+            # Tworzenie tymczasowego pliku lokalnego
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(file_bytes)
+                temp_file_path = temp_file.name
+            
+            if isinstance(conn, SFTPHandler):
+                # SFTP - LibreELEC
+                full_path = os.path.join(remote_path, file_name).replace('\\', '/')
+                conn.upload_file(temp_file_path, full_path)
+                conn.close()
+            else:
+                # FTP tradycyjny
+                conn.cwd(remote_path)
+                with open(temp_file_path, 'rb') as file:
+                    conn.storbinary(f'STOR {file_name}', file)
+                conn.quit()
+            
+            # Usunięcie tymczasowego pliku
+            os.remove(temp_file_path)
+            
+            return jsonify({"message": f"Plik {file_name} został pomyślnie przesłany"})
+        except Exception as e:
+            try:
+                if isinstance(conn, SFTPHandler):
+                    conn.close()
+                else:
+                    conn.quit()
+            except:
+                pass
+            
+            # Próba usunięcia tymczasowego pliku
+            try:
+                if 'temp_file_path' in locals():
+                    os.remove(temp_file_path)
+            except:
+                pass
+                
+            return jsonify({"error": f"Błąd podczas przesyłania pliku: {str(e)}"}), 500
 
 @app.route('/api/ftp/delete', methods=['POST'])
 @token_required
@@ -629,7 +815,7 @@ def delete_ftp_file():
         return jsonify({"error": "Brakujące dane do usunięcia pliku"}), 400
     
     file_path = data['path']
-    is_directory = data.get('is_directory', False)
+    is_directory = data.get('is_directory', False) or data.get('isDirectory', False)
     
     # Konwersja portu na int
     port = 21
@@ -639,17 +825,22 @@ def delete_ftp_file():
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    # Połączenie z serwerem FTP
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
+    # Połączenie z serwerem (FTP lub SFTP)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
     
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
-        # Usunięcie pliku lub katalogu
-        result = ftp_delete_file(ftp, file_path, is_directory)
-        
-        ftp.quit()
+        if isinstance(conn, SFTPHandler):
+            # SFTP - LibreELEC
+            result = conn.delete_file(file_path, is_directory)
+            conn.close()
+        else:
+            # FTP tradycyjny
+            result = ftp_delete_file(conn, file_path, is_directory)
+            conn.quit()
         
         if result:
             return jsonify({"message": f"{'Katalog' if is_directory else 'Plik'} został pomyślnie usunięty"})
@@ -657,7 +848,10 @@ def delete_ftp_file():
             return jsonify({"error": f"Nie można usunąć {'katalogu' if is_directory else 'pliku'}"}), 500
     except Exception as e:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
         return jsonify({"error": f"Błąd podczas usuwania: {str(e)}"}), 500
@@ -772,21 +966,27 @@ def create_ftp_directory():
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    # Połączenie z serwerem FTP
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
+    # Tworzenie pełnej ścieżki do nowego katalogu
+    new_dir_path = os.path.join(parent_path, folder_name).replace('\\', '/')
     
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    # Połączenie z serwerem (FTP lub SFTP)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
+    
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
-        # Przejdź do katalogu nadrzędnego
-        ftp.cwd(parent_path)
+        if isinstance(conn, SFTPHandler):
+            # SFTP - LibreELEC
+            result = conn.create_directory(new_dir_path)
+            conn.close()
+        else:
+            # FTP tradycyjny
+            conn.cwd(parent_path)
+            result = ftp_create_directory(conn, folder_name)
+            conn.quit()
         
-        # Utwórz nowy katalog
-        new_dir_path = os.path.join(parent_path, folder_name).replace('\\', '/')
-        result = ftp_create_directory(ftp, folder_name)
-        
-        ftp.quit()
         
         if result:
             return jsonify({"message": f"Katalog {folder_name} został pomyślnie utworzony", "path": new_dir_path})
@@ -794,7 +994,10 @@ def create_ftp_directory():
             return jsonify({"error": f"Nie można utworzyć katalogu {folder_name}"}), 500
     except Exception as e:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
         return jsonify({"error": f"Błąd podczas tworzenia katalogu: {str(e)}"}), 500
@@ -886,8 +1089,8 @@ def restart_kiosk_service(kiosk_id):
     
     conn = get_db_connection()
     
-    # Sprawdzenie, czy kiosk istnieje
-    kiosk = conn.execute('SELECT id, name, ip_address FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
+    # Sprawdzenie, czy kiosk istnieje (pobierz także ftp_username do użycia jako domyślna nazwa użytkownika SSH)
+    kiosk = conn.execute('SELECT id, name, ip_address, ftp_username FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
     if not kiosk:
         conn.close()
         return jsonify({"error": "Kiosk nie znaleziony"}), 404
@@ -906,11 +1109,14 @@ def restart_kiosk_service(kiosk_id):
     # Zamień ustawienia na słownik
     settings_dict = {setting['key']: setting['value'] for setting in settings}
     
-    # Nazwa użytkownika SSH jest stała lub z ustawień (uwierzytelnianie zawsze przez klucz SSH)
-    ssh_username = request_data.get('username') or settings_dict.get('defaultSshUsername', 'kiosk')
+    # Preferuj kolejno: nazwę użytkownika z żądania -> ftp_username kiosku -> domyślne ustawienie -> 'root'
+    ssh_username = request_data.get('username')
+    if not ssh_username:
+        kiosk_ftp_user = kiosk['ftp_username'] if 'ftp_username' in kiosk.keys() else None
+        ssh_username = kiosk_ftp_user or settings_dict.get('defaultSshUsername', 'root')
     
     # Określamy ścieżkę do klucza SSH - zawsze używamy stałej nazwy pliku
-    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa')
+    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
     
     # Sprawdzenie czy klucz SSH istnieje
     if not os.path.exists(ssh_key_path):
@@ -934,34 +1140,59 @@ def restart_kiosk_service(kiosk_id):
             # Załaduj klucz SSH
             try:
                 private_key = paramiko.RSAKey.from_private_key_file(ssh_key_path)
+                print(f"Klucz SSH załadowany pomyślnie: {ssh_key_path}")
             except Exception as key_error:
                 print(f"Błąd podczas ładowania klucza SSH: {key_error}")
                 return jsonify({"error": f"Błąd podczas ładowania klucza SSH: {str(key_error)}"}), 500
 
             # Połącz z kioskiem przez SSH używając klucza
-            ssh.connect(
-                hostname=kiosk['ip_address'],
-                port=ssh_port,
-                username=ssh_username,
-                pkey=private_key,
-                timeout=10
-            )
+            try:
+                ssh.connect(
+                    hostname=kiosk['ip_address'],
+                    port=ssh_port,
+                    username=ssh_username,
+                    pkey=private_key,
+                    timeout=10,
+                    look_for_keys=False,
+                    allow_agent=False
+                )
+                print(f"Połączono przez SSH używając klucza")
+            except paramiko.AuthenticationException:
+                # Jeśli autentykacja kluczem nie zadziałała, spróbuj z hasłem (jeśli podane)
+                ssh_password = request_data.get('password')
+                if ssh_password:
+                    print(f"Autentykacja kluczem nieudana, próba z hasłem...")
+                    ssh.connect(
+                        hostname=kiosk['ip_address'],
+                        port=ssh_port,
+                        username=ssh_username,
+                        password=ssh_password,
+                        timeout=10,
+                        look_for_keys=False,
+                        allow_agent=False
+                    )
+                    print(f"Połączono przez SSH używając hasła")
+                else:
+                    raise
         except Exception as e:
+            print(f"Błąd połączenia SSH: {str(e)}")
             return jsonify({
-                "error": f"Nie można połączyć się z kioskiem przez SSH: {str(e)}"
+                "error": f"Nie można połączyć się z kioskiem przez SSH: {str(e)}. Sprawdź czy klucz publiczny jest zainstalowany na kiosku w ~/.ssh/authorized_keys lub podaj hasło SSH."
             }), 500
         
         # Wykonaj komendę restartu usługi
         try:
-            # Spróbuj użyć sudo (bez hasła, jeśli kiosk ma skonfigurowany sudo bez hasła)
-            restart_cmd = f"sudo systemctl restart kiosk.service"
+            # Zawsze restartuj kiosk.service niezależnie od systemu
+            service_name = 'kiosk.service'
+            print(f"Restarting service: {service_name}")
+            restart_cmd = f"sudo systemctl restart {service_name}"
             print(f"Executing command: {restart_cmd}")
             stdin, stdout, stderr = ssh.exec_command(restart_cmd, timeout=10)
             exit_code = stdout.channel.recv_exit_status()
             
             if exit_code != 0:
                 # Jeśli sudo nie zadziałało, spróbuj użyć systemctl bez sudo
-                restart_cmd = f"systemctl --user restart kiosk.service"
+                restart_cmd = f"systemctl restart {service_name}"
                 print(f"First command failed, trying: {restart_cmd}")
                 stdin, stdout, stderr = ssh.exec_command(restart_cmd, timeout=10)
                 exit_code = stdout.channel.recv_exit_status()
@@ -970,10 +1201,13 @@ def restart_kiosk_service(kiosk_id):
                     # Logowanie błędów
                     err_output = stderr.read().decode('utf-8').strip()
                     return jsonify({
-                        "error": f"Błąd podczas restartu usługi: {err_output}",
+                        "error": f"Błąd podczas restartu usługi {service_name}: {err_output}",
                         "command": restart_cmd,
                         "exit_code": exit_code
                     }), 500
+            
+            success_message = f"Usługa {service_name} została pomyślnie zrestartowana na kiosku {kiosk['name'] or kiosk['id']}"
+            print(success_message)
         except Exception as e:
             return jsonify({"error": f"Błąd wykonania komendy: {str(e)}"}), 500
         finally:
@@ -991,7 +1225,7 @@ def restart_kiosk_service(kiosk_id):
         conn.close()
         
         return jsonify({
-            "message": f"Usługa kiosk została pomyślnie zrestartowana na kiosku {kiosk['name'] or kiosk['id']}"
+            "message": success_message
         })
     except ImportError:
         return jsonify({
@@ -1004,42 +1238,63 @@ def restart_kiosk_service(kiosk_id):
 @token_required
 def api_get_file_content():
     data = request.json
-    required_fields = ['hostname', 'username', 'password', 'path']
+    required_fields = ['hostname', 'username', 'path']
     
     if not data or not all(field in data for field in required_fields):
-        return jsonify({"error": "Brakujące dane połączenia FTP"}), 400
+        missing = [f for f in required_fields if f not in data] if data else required_fields
+        return jsonify({"error": f"Brakujące dane: {', '.join(missing)}"}), 400
     
     hostname = data['hostname']
     port = int(data.get('port', 21))
     username = data['username']
-    password = data['password']
+    password = data.get('password', '')
     file_path = data['path']
     
+    print(f"GET file content: {file_path} from {hostname}:{port} (user: {username})")
+    
     # Jeśli hasło jest zaszyfrowane, odszyfruj je
-    if password.startswith('ENC:'):
+    if password and isinstance(password, str) and password.startswith('ENC:'):
         password = decrypt_data(password[4:])
     
-    # Połącz z FTP
-    ftp = ftp_connect(hostname, username, password, port)
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    # Połącz z FTP lub SFTP (w zależności od portu)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(hostname, username, password, port)
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
-        # Pobierz zawartość pliku
-        content = ftp_get_file_content(ftp, file_path)
+        # Pobierz zawartość pliku (wymagane UTF-8)
+        if isinstance(conn, SFTPHandler):
+            # SFTP - LibreELEC
+            content = conn.get_file_content(file_path)
+            conn.close()
+        else:
+            # FTP tradycyjny
+            content = ftp_get_file_content(conn, file_path)
+            conn.quit()
+            
         if content is None:
             return jsonify({"error": f"Nie można pobrać zawartości pliku {file_path}"}), 500
-        
+
         return jsonify({
             "content": content,
             "path": file_path,
             "message": "Zawartość pliku pobrana pomyślnie"
         })
+    except UnicodeDecodeError:
+        return jsonify({
+            "error": "Plik nie jest w kodowaniu UTF-8. Proszę zapisać plik w UTF-8 i spróbować ponownie.",
+            "path": file_path
+        }), 415  # Unsupported Media Type
     except Exception as e:
+        print(f"Error getting file content: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
 
@@ -1047,30 +1302,42 @@ def api_get_file_content():
 @token_required
 def api_put_file_content():
     data = request.json
-    required_fields = ['hostname', 'username', 'password', 'path', 'content']
+    required_fields = ['hostname', 'username', 'path', 'content']
     
     if not data or not all(field in data for field in required_fields):
-        return jsonify({"error": "Brakujące dane połączenia FTP lub zawartość pliku"}), 400
+        missing = [f for f in required_fields if f not in data] if data else required_fields
+        return jsonify({"error": f"Brakujące dane: {', '.join(missing)}"}), 400
     
     hostname = data['hostname']
     port = int(data.get('port', 21))
     username = data['username']
-    password = data['password']
+    password = data.get('password', '')
     file_path = data['path']
     content = data['content']
     
+    print(f"PUT file content: {file_path} to {hostname}:{port} (user: {username}), content length: {len(content)}")
+    
     # Jeśli hasło jest zaszyfrowane, odszyfruj je
-    if password.startswith('ENC:'):
+    if password and isinstance(password, str) and password.startswith('ENC:'):
         password = decrypt_data(password[4:])
     
-    # Połącz z FTP
-    ftp = ftp_connect(hostname, username, password, port)
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    # Połącz z FTP lub SFTP (w zależności od portu)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(hostname, username, password, port)
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
         # Zapisz zawartość pliku
-        success = ftp_put_file_content(ftp, file_path, content)
+        if isinstance(conn, SFTPHandler):
+            # SFTP - LibreELEC
+            success = conn.put_file_content(file_path, content)
+            conn.close()
+        else:
+            # FTP tradycyjny
+            success = ftp_put_file_content(conn, file_path, content)
+            conn.quit()
+            
         if not success:
             return jsonify({"error": f"Nie można zapisać zawartości pliku {file_path}"}), 500
         
@@ -1079,26 +1346,52 @@ def api_put_file_content():
             "message": "Zawartość pliku zapisana pomyślnie"
         })
     except Exception as e:
+        print(f"Error putting file content: {str(e)}")
         return jsonify({"error": str(e)}), 500
     finally:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
 
-# Obracanie ekranu kiosku przez SSH za pomocą xrandr
+""" Obracanie ekranu kiosku przez SSH za pomocą xrandr.
+
+Akceptowane orientacje (kompatybilne z frontendem):
+- 'right' | '0' | 'normal'
+
+Obsługiwane dodatkowo (na przyszłość):
+- 'left' | 'inverted'
+
+Strategia:
+1) Spróbuj legacy: xrandr -o <orientation> (akceptuje '0/right/left/inverted')
+2) Fallback: znajdź pierwszy podłączony output i wykonaj: xrandr --output <OUT> --rotate <normal|right|left|inverted>
+   (z mapowaniem '0' -> 'normal')
+"""
 @app.route('/api/kiosks/<int:kiosk_id>/rotate-display', methods=['POST'])
 @token_required
 def rotate_kiosk_display(kiosk_id):
     data = request.json or {}
     orientation = (data.get('orientation') or '').strip().lower()
-    if orientation not in ['right', '0', 'normal']:
-        return jsonify({"error": "Nieprawidłowa orientacja. Użyj 'right' lub '0' (normal)."}), 400
-    if orientation == 'normal':
-        orientation = '0'
+    allowed = ['right', '0', 'normal', 'left', 'inverted', '90', '270', '180']
+    if orientation not in allowed:
+        return jsonify({"error": "Nieprawidłowa orientacja. Dozwolone: right | 0 (normal) | left | inverted | 90 | 180 | 270"}), 400
+    # Znormalizuj do wartości wspieranych przez xrandr ('normal','right','left','inverted')
+    if orientation == '0' or orientation == 'normal':
+        normalized = 'normal'
+    elif orientation == '90' or orientation == 'right':
+        normalized = 'right'
+    elif orientation == '270' or orientation == 'left':
+        normalized = 'left'
+    elif orientation == '180' or orientation == 'inverted':
+        normalized = 'inverted'
+    else:
+        normalized = orientation
 
     conn = get_db_connection()
-    kiosk = conn.execute('SELECT id, name, ip_address FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
+    kiosk = conn.execute('SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
     conn.close()
     if not kiosk:
         return jsonify({"error": "Kiosk nie znaleziony"}), 404
@@ -1110,22 +1403,55 @@ def rotate_kiosk_display(kiosk_id):
     settings = conn.execute('SELECT key, value FROM settings WHERE key IN ("defaultSshUsername", "defaultSshPort")').fetchall()
     conn.close()
     settings_dict = {s['key']: s['value'] for s in settings}
-    ssh_username = settings_dict.get('defaultSshUsername', 'kiosk')
+    # Preferuj ftp_username kiosku jako nazwę użytkownika SSH, w przeciwnym razie użyj ustawień lub 'root'
+    ssh_username = kiosk['ftp_username'] if kiosk['ftp_username'] else settings_dict.get('defaultSshUsername', 'root')
     ssh_port = int(settings_dict.get('defaultSshPort', 22))
 
-    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa')
-    if not os.path.exists(ssh_key_path):
-        return jsonify({"error": "Brak klucza SSH backend/ssh_keys/kiosk_id_rsa"}), 500
+    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
+    has_key = os.path.exists(ssh_key_path)
+    ssh_password = kiosk['ftp_password'] if 'ftp_password' in kiosk.keys() else None
+    if not has_key and not ssh_password:
+        return jsonify({"error": "Brak klucza SSH i hasła. Skonfiguruj backend/ssh_keys/kiosk_id_rsa_openssh lub ustaw ftp_password dla kiosku."}), 500
 
     try:
         import paramiko
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        key = paramiko.RSAKey.from_private_key_file(ssh_key_path)
-        ssh.connect(kiosk['ip_address'], port=ssh_port, username=ssh_username, pkey=key, timeout=10)
+        # Spróbuj połączyć się kluczem, a w razie niepowodzenia hasłem (jeśli jest dostępne)
+        connected = False
+        last_err = None
+        if has_key:
+            try:
+                key = paramiko.RSAKey.from_private_key_file(ssh_key_path)
+                ssh.connect(kiosk['ip_address'], port=ssh_port, username=ssh_username, pkey=key, timeout=10)
+                connected = True
+            except Exception as e_auth:
+                last_err = e_auth
+        if not connected and ssh_password:
+            try:
+                ssh.connect(kiosk['ip_address'], port=ssh_port, username=ssh_username, password=ssh_password, timeout=10)
+                connected = True
+            except Exception as e_auth2:
+                last_err = e_auth2
+        if not connected:
+            raise last_err or Exception("Nie udało się uwierzytelnić przez SSH (klucz ani hasło nie zadziałały)")
 
-        # Wykonaj polecenie xrandr na ekranie :0
-        cmd = f"bash -lc 'export DISPLAY=:0; xrandr -o {orientation}'"
+        # Wykonaj xrandr na ekranie :0, ustawiając zarówno orientację ekranu (-o), jak i per-output (--rotate)
+        # To zapewnia poprawny powrót do 'normal', niezależnie od wcześniejszej metody.
+        cmd = (
+            "bash -lc '"
+            "export DISPLAY=:0; "
+            f"ORI=\"{normalized}\"; "
+            # Najpierw spróbuj ustawić orientację ekranu (może się nie powieść na niektórych konfiguracjach)
+            "if ! xrandr -o \"$ORI\" >/dev/null 2>&1; then XO_ERR=1; else XO_ERR=0; fi; "
+            # Następnie ustaw orientację na pierwszym podłączonym wyjściu (per-output)
+            "OUT=$(xrandr | awk \"/ connected/{print $1; exit}\"); "
+            "if [ -n \"$OUT\" ]; then "
+            "  if ! xrandr --output \"$OUT\" --rotate \"$ORI\" >/dev/null 2>&1; then PO_ERR=1; else PO_ERR=0; fi; "
+            "else PO_ERR=1; fi; "
+            # Jeśli obie metody zawiodły, zwróć błąd
+            "if [ $XO_ERR -ne 0 ] && [ $PO_ERR -ne 0 ]; then echo \"rotation failed (screen and per-output)\" 1>&2; exit 1; fi'"
+        )
         stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
         out = stdout.read().decode('utf-8', errors='ignore').strip()
         err = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -1133,7 +1459,7 @@ def rotate_kiosk_display(kiosk_id):
         ssh.close()
 
         if code != 0:
-            return jsonify({"error": f"Błąd xrandr: {err or 'nieznany błąd'}", "stdout": out}), 500
+            return jsonify({"error": f"Błąd xrandr: {err or 'nieznany błąd'}", "stdout": out, "stderr": err, "exitCode": code}), 500
 
         return jsonify({"message": "Ekran obrócony", "stdout": out})
     except ImportError:

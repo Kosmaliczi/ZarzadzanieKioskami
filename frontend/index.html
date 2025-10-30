@@ -94,15 +94,27 @@
                 <div class="header-with-button">
                     <h2>Edytor pliku tekstowego (.txt)</h2>
                 </div>
+                <!-- Wybór kiosku jak w sekcji Playlisty; sam wybór łączy z FTP -->
+                <div class="kiosk-selector">
+                    <label for="editor-kiosk-select">Wybierz kiosk:</label>
+                    <select id="editor-kiosk-select" class="wybierz-kiosk">
+                        <option value="" disabled selected>Wybierz kiosk...</option>
+                    </select>
+                    <label style="margin-left: 8px; font-size: 13px; color: #444;">
+                        <input type="checkbox" id="editor-kiosk-only-active" checked> Tylko aktywne
+                    </label>
+                    <button id="editor-refresh-kiosks" class="btn" style="margin-left: 8px;"><i class="fas fa-sync"></i> Odśwież</button>
+                    <button id="editor-connect-btn" class="btn primary" style="margin-left: 4px;"><i class="fas fa-plug"></i> Połącz</button>
+                </div>
                 <div class="text-editor-controls" style="margin-bottom: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
                     <label for="text-file-path" style="min-width: 110px;">Ścieżka pliku:</label>
-                    <input type="text" id="text-file-path" value="/napis.txt" placeholder="/napis.txt" style="flex: 1 1 300px; padding: 6px 8px;">
+                    <input type="text" id="text-file-path" value="napis.txt" placeholder="napis.txt" style="flex: 1 1 300px; padding: 6px 8px;">
                     <button id="load-text" class="btn"><i class="fas fa-download"></i> Wczytaj</button>
                     <button id="save-text" class="btn primary"><i class="fas fa-save"></i> Zapisz</button>
                 </div>
                 <textarea id="text-editor-area" rows="12" cols="80" placeholder="Wprowadź tekst..." style="width: 100%; min-height: 220px;"></textarea>
                 <p style="font-size: 12px; color: #666; margin-top: 6px;">
-                    Uwaga: aby wczytać/zapisać plik, najpierw połącz się z serwerem FTP w sekcji „FTP”.
+                    Wybierz kiosk powyżej, aby połączyć się z FTP. Następnie możesz wczytać lub zapisać plik .txt.
                 </p>
             </section>
 
