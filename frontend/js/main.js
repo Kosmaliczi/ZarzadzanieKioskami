@@ -436,7 +436,7 @@ function setupForms() {
             document.getElementById('ftp-kiosk-tiles').classList.add('hidden');
             
             // Załaduj pliki - użyj domyślnej ścieżki w zależności od portu
-            const defaultPath = (parseInt(port) === 22) ? '/storage/videos' : '/';
+            const defaultPath = (parseInt(port) === 22) ? '/home/kiosk/MediaPionowe/converted' : '/';
             loadFtpFiles(defaultPath);
 
             // Włącz przyciski edytora tekstu po nawiązaniu połączenia

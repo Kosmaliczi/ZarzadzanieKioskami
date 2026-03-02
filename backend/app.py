@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import datetime
-from flask import Flask, request, jsonify, send_file, after_this_request
+from flask import Flask, request, jsonify, send_file, after_this_request, send_from_directory
 from flask_cors import CORS
 import ftplib
 from dotenv import load_dotenv
@@ -1466,6 +1466,37 @@ def rotate_kiosk_display(kiosk_id):
         return jsonify({"error": "Brak biblioteki paramiko. Zainstaluj: pip install paramiko"}), 500
     except Exception as e:
         return jsonify({"error": f"Nieoczekiwany błąd: {str(e)}"}), 500
+
+# =============================================================================
+# TRASY DO SERWOWANIA FRONTENDU
+# =============================================================================
+
+# Ścieżka do folderu frontend
+FRONTEND_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'frontend')
+
+@app.route('/')
+def index():
+    """Strona główna - przekierowanie do logowania"""
+    return send_from_directory(FRONTEND_PATH, 'login.html')
+
+@app.route('/login')
+def login_page():
+    """Strona logowania"""
+    return send_from_directory(FRONTEND_PATH, 'login.html')
+
+@app.route('/dashboard')
+def dashboard():
+    """Panel główny (po zalogowaniu)"""
+    return send_from_directory(FRONTEND_PATH, 'index.html')
+
+@app.route('/<path:filename>')
+def serve_frontend(filename):
+    """Serwowanie plików statycznych frontendu (CSS, JS, obrazy)"""
+    try:
+        return send_from_directory(FRONTEND_PATH, filename)
+    except:
+        # Jeśli plik nie istnieje, zwróć 404
+        return jsonify({"error": "File not found"}), 404
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

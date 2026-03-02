@@ -239,4 +239,4 @@ class ApiError extends Error {
 }
 
 // Inicjalizacja klienta API z bezpośrednim adresem localhost
-const api = new ApiClient('http://10.0.0.163:5000');
+const api = new ApiClient('http://10.0.0.127:5000');
