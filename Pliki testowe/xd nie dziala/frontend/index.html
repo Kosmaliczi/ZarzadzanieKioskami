@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Zarządzania Kioskami</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">        <header>            <h1>System Zarządzania Kioskami</h1>
+            <div class="user-info">
+                <span id="current-date">22 maja 2025</span>
+                <span class="user-separator">|</span>
+                <span id="username-display"><i class="fas fa-user"></i> <span id="username-text">Użytkownik</span></span>
+                <button id="logout-btn" title="Wyloguj"><i class="fas fa-sign-out-alt"></i></button>
+            </div>
+        </header>
+
+        <nav>
+            <ul>
+                <li><a href="#" class="active" data-section="dashboard"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                <li><a href="#" data-section="kiosks"><i class="fas fa-tablet-alt"></i> Kioski</a></li>
+                <li><a href="#" data-section="playlist"><i class="fas fa-list"></i> Playlista</a></li>
+                <li><a href="#" data-section="ftp"><i class="fas fa-server"></i> FTP</a></li>
+                <li><a href="#" data-section="settings"><i class="fas fa-cog"></i> Ustawienia</a></li>
+            </ul>
+        </nav>
+
+        <main>
+            <!-- Dashboard Section -->
+            <section id="dashboard" class="active-section">
+                <h2>Dashboard</h2>
+                <div class="stats-container">
+                    <div class="stat-card">
+                        <h3>Wszystkie kioski</h3>
+                        <div class="stat-value" id="total-kiosks">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Online</h3>
+                        <div class="stat-value" id="online-kiosks">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Offline</h3>
+                        <div class="stat-value" id="offline-kiosks">0</div>
+                    </div>
+                </div>
+
+                <div class="recent-activity">
+                    <h3>Ostatnia aktywność</h3>
+                    <div class="activity-list" id="recent-activity-list">
+                        <p>Brak danych o aktywności</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Kiosks Section -->
+            <section id="kiosks">
+                <div class="header-with-button">
+                    <h2>Zarządzanie kioskami</h2>
+                    <button id="add-kiosk-btn" class="btn primary"><i class="fas fa-plus"></i> Dodaj kiosk</button>
+                </div>
+                <div class="actions-bar">
+                    <div class="search-container">
+                        <input type="text" id="search-kiosk" placeholder="Szukaj kiosku...">
+                        <button class="btn"><i class="fas fa-search"></i></button>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table id="kiosks-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Nazwa</th>
+                                <th>MAC</th>
+                                <th>S/N</th>
+                                <th>IP</th>
+                                <th>Status</th>
+                                <th>Ostatnie połączenie</th>
+                                <th>Akcje</th>
+                            </tr>
+                        </thead>
+                        <tbody id="kiosks-table-body">
+                            <!-- Dane będą wstawiane przez JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- FTP Section -->
+            <section id="ftp">
+                <div class="header-with-button">
+                    <h2>FTP</h2>
+                    <div class="ftp-filter">
+                        <input type="text" id="ftp-search" placeholder="Szukaj kiosku...">
+                        <button class="btn"><i class="fas fa-search"></i></button>
+                    </div>
+                </div>
+
+                <!-- Lista kiosków jako kafelki -->
+                <div class="kiosk-tiles" id="ftp-kiosk-tiles">
+                    <!-- Kafelki będą generowane przez JavaScript -->
+                    <div class="kiosk-tile-empty">Ładowanie kiosków...</div>
+                </div>
+
+                <!-- Formularz połączenia FTP po wybraniu kiosku -->
+                <div class="ftp-connection hidden" id="ftp-connection-form">
+                    <div class="connection-header">
+                        <button class="btn" id="ftp-back-to-kiosks"><i class="fas fa-arrow-left"></i> Wróć do listy</button>
+                        <h3>Połączenie FTP: <span id="selected-kiosk-name">Kiosk</span></h3>
+                    </div>
+                    <input type="hidden" id="selected-kiosk-id">
+                    <div class="form-group">
+                        <label for="ftp-hostname">Hostname:</label>
+                        <input type="text" id="ftp-hostname" placeholder="np. ftp.example.com">
+                    </div>
+                    <div class="form-group">
+                        <label for="ftp-port">Port:</label>
+                        <input type="number" id="ftp-port" value="21">
+                    </div>
+                    <div class="form-group">
+                        <label for="ftp-username">Użytkownik:</label>
+                        <input type="text" id="ftp-username">
+                    </div>
+                    <div class="form-group">
+                        <label for="ftp-password">Hasło:</label>
+                        <input type="password" id="ftp-password">
+                    </div>
+                    <button id="ftp-connect-btn" class="btn primary">Połącz</button>
+                </div>
+
+                <!-- Przeglądarka plików FTP -->
+                <div class="ftp-browser hidden" id="ftp-browser">
+                    <div class="browser-header">
+                        <button class="btn" id="ftp-disconnect-btn"><i class="fas fa-sign-out-alt"></i> Rozłącz</button>
+                        <h3>Pliki FTP: <span id="ftp-connected-kiosk">Kiosk</span></h3>
+                    </div>
+                    <div class="ftp-navigator">
+                        <button id="ftp-back-btn" class="btn" title="Wstecz"><i class="fas fa-arrow-left"></i></button>
+                        <button id="ftp-up-btn" class="btn" title="W górę"><i class="fas fa-arrow-up"></i></button>
+                        <input type="text" id="ftp-path" value="/">
+                        <button id="ftp-go-btn" class="btn" title="Przejdź"><i class="fas fa-location-arrow"></i></button>
+                        <button id="ftp-refresh-btn" class="btn" title="Odśwież"><i class="fas fa-sync"></i></button>
+                    </div>
+                    
+                    <div class="ftp-actions">
+                        <button id="ftp-upload-btn" class="btn primary"><i class="fas fa-upload"></i> Wyślij plik</button>
+                        <button id="ftp-new-folder-btn" class="btn"><i class="fas fa-folder-plus"></i> Nowy folder</button>
+                        <button id="ftp-delete-btn" class="btn danger hidden"><i class="fas fa-trash"></i> Usuń zaznaczone</button>
+                    </div>
+                    
+                    <!-- Dodanie strefy drag and drop -->
+                    <div id="ftp-drop-zone" class="ftp-drop-zone">
+                        <div class="drop-zone-message">
+                            <i class="fas fa-cloud-upload-alt"></i>
+                            <p>Przeciągnij i upuść pliki tutaj, aby je przesłać</p>
+                        </div>
+                    </div>
+                    
+                    <div class="ftp-files">
+                        <table id="ftp-files-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-files"></th>
+                                    <th>Nazwa</th>
+                                    <th>Typ</th>
+                                    <th>Rozmiar</th>
+                                    <th>Data modyfikacji</th>
+                                    <th>Akcje</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ftp-files-body">
+                                <!-- Dane będą wstawiane przez JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                
+                <!-- Input ukryty do przesyłania plików -->
+                <input type="file" id="ftp-file-upload" style="display: none">
+            </section>
+
+            <!-- Settings Section -->
+            <section id="settings">
+                <h2>Ustawienia</h2>
+                <div class="settings-container">
+                    <div class="settings-card">
+                        <h3>Ustawienia aplikacji</h3>
+                        <div class="form-group">
+                            <label for="setting-refresh-interval">Interwał odświeżania (s):</label>
+                            <input type="number" id="setting-refresh-interval" value="30" min="5">
+                        </div>
+                    </div>
+                    
+                    <div class="settings-card">
+                        <h3>Ustawienia portów</h3>
+                        <div class="form-group">
+                            <label for="setting-ftp-port">Domyślny port FTP:</label>
+                            <input type="number" id="setting-ftp-port" value="21" min="1" max="65535">
+                        </div>
+                        <div class="form-group">
+                            <label for="setting-ssh-port">Domyślny port SSH:</label>
+                            <input type="number" id="setting-ssh-port" value="22" min="1" max="65535">
+                        </div>
+                    </div>
+                    
+                    <div class="settings-card">
+                        <h3>Ustawienia FTP</h3>
+                        <div class="form-group">
+                            <label for="setting-ftp-path">Domyślna ścieżka FTP:</label>
+                            <input type="text" id="setting-ftp-path" value="/home/kiosk/MediaPionowe">
+                        </div>
+                        <div class="form-group">
+                            <label for="setting-ftp-username">Domyślny użytkownik FTP:</label>
+                            <input type="text" id="setting-ftp-username" placeholder="np. kiosk">
+                        </div>
+                        <div class="form-group">
+                            <label for="setting-ftp-password">Domyślne hasło FTP:</label>
+                            <input type="password" id="setting-ftp-password" placeholder="Domyślne hasło">
+                        </div>
+                    </div>
+                      <div class="settings-card">
+                        <h3>Ustawienia SSH</h3>
+                        <div class="form-group">
+                            <label for="setting-ssh-username">Domyślny użytkownik SSH:</label>
+                            <input type="text" id="setting-ssh-username" value="kiosk" readonly>
+                        </div>
+                        <div class="form-group">
+                            <label for="setting-ssh-password">Domyślne hasło SSH:</label>
+                            <input type="password" id="setting-ssh-password" placeholder="Domyślne hasło">
+                        </div>
+                    </div>
+                    
+                    <button id="save-settings-btn" class="btn primary">Zapisz ustawienia</button>
+                </div>
+            </section>
+
+            <!-- Playlist Section -->
+            <section id="playlist">
+                <div class="header-with-button">
+                    <h2>Zarządzanie playlistą</h2>
+                    <div class="kiosk-selector">
+                        <label for="playlist-kiosk-select">Wybierz kiosk:</label>
+                        <select id="playlist-kiosk-select" class="wybierz-kiosk">
+                            <option value="" disabled selected>Wybierz kiosk...</option>
+                            <!-- Opcje będą generowane przez JavaScript -->
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="playlist-container" id="playlist-container">
+                    <div class="playlist-files-panel">
+                        <h3>Pliki dostępne w kiosku</h3>                        <div class="playlist-files-toolbar">
+                            <button id="refresh-playlist-files" class="btn"><i class="fas fa-sync"></i> Odśwież</button>
+                        </div>
+                        <div class="playlist-files-list" id="playlist-files-list">
+                            <table id="playlist-files-table">
+                                <thead>
+                                    <tr>
+                                        <th>Nazwa</th>
+                                        <th>Typ</th>
+                                        <th>Rozmiar</th>
+                                        <th>Akcje</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="playlist-files-body">
+                                    <!-- Dane będą wstawiane przez JavaScript -->
+                                    <tr>
+                                        <td colspan="4" style="text-align: center;">Wybierz kiosk, aby zobaczyć pliki</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                      <div class="playlist-editor-panel">
+                        <h3>Edytor playlisty</h3>
+                        <div class="playlist-editor-toolbar">
+                            <button id="save-playlist" class="btn primary"><i class="fas fa-save"></i> Zapisz playlistę</button>
+                            <button id="add-playlist-item" class="btn"><i class="fas fa-plus"></i> Dodaj element</button>
+                        </div>
+                        <div class="playlist-editor" id="playlist-editor">
+                            <div class="playlist-status" id="playlist-status">
+                                <p>Wybierz kiosk i pobierz plik schedule.json</p>
+                            </div>
+                            <div id="schedule-items-container" class="schedule-items-container hidden">
+                                <!-- Tutaj będą wyświetlane elementy playlisty generowane przez JS -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="add-kiosk-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Dodaj nowy kiosk</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="kiosk-name">Nazwa kiosku:</label>
+                    <input type="text" id="kiosk-name" placeholder="np. Kiosk-1">
+                </div>
+                <div class="form-group">
+                    <label for="kiosk-mac">Adres MAC:</label>
+                    <input type="text" id="kiosk-mac" placeholder="np. 00:1A:2B:3C:4D:5E">
+                </div>
+                <div class="form-group">
+                    <label for="kiosk-sn">Numer seryjny:</label>
+                    <input type="text" id="kiosk-sn" placeholder="np. SN12345678">
+                </div>
+                <div class="form-group">
+                    <label for="kiosk-ftp-username">Użytkownik FTP:</label>
+                    <input type="text" id="kiosk-ftp-username" placeholder="np. kiosk">
+                </div>
+                <div class="form-group">
+                    <label for="kiosk-ftp-password">Hasło FTP:</label>
+                    <input type="password" id="kiosk-ftp-password" placeholder="Hasło FTP">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="cancel-add-kiosk" class="btn">Anuluj</button>
+                <button id="submit-add-kiosk" class="btn primary">Dodaj</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="edit-kiosk-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Edytuj kiosk</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-kiosk-id">
+                <div class="form-group">
+                    <label for="edit-kiosk-name">Nazwa kiosku:</label>
+                    <input type="text" id="edit-kiosk-name">
+                </div>
+                <div class="form-group">
+                    <label for="edit-kiosk-mac">Adres MAC:</label>
+                    <input type="text" id="edit-kiosk-mac">
+                </div>
+                <div class="form-group">
+                    <label for="edit-kiosk-sn">Numer seryjny:</label>
+                    <input type="text" id="edit-kiosk-sn">
+                </div>
+                <div class="form-group">
+                    <label for="edit-kiosk-ftp-username">Użytkownik FTP:</label>
+                    <input type="text" id="edit-kiosk-ftp-username">
+                </div>
+                <div class="form-group">
+                    <label for="edit-kiosk-ftp-password">Hasło FTP:</label>
+                    <input type="password" id="edit-kiosk-ftp-password" placeholder="Pozostaw puste, aby nie zmieniać">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="cancel-edit-kiosk" class="btn">Anuluj</button>
+                <button id="submit-edit-kiosk" class="btn primary">Zapisz zmiany</button>
+            </div>
+        </div>    </div>
+
+    <div id="toast-container"></div>
+    <div id="version-info" class="version-badge">Wersja 1.0</div>
+    <script src="js/config.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/playlist.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

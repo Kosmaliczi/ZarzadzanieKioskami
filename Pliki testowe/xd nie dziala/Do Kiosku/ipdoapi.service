@@ -1,0 +1,11 @@
+[Unit]
+Description=Skrypt wysylajacy ip do API Strony
+After=network.target
+
+[Service]
+Type=idle
+User=root
+ExecStart=/usr/bin/python /etc/systemd/system/ipdoapi.py
+
+[Install]
+WantedBy=multi-user.target

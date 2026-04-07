@@ -1,0 +1,41 @@
+# ============================================
+# Kiosk Manager - Wymagane oprogramowanie
+# ============================================
+# 
+# Instalacja: pip install -r requirements.txt
+#
+
+# Framework webowy
+Flask==2.3.3
+Werkzeug==2.3.7
+Flask-Cors==4.0.0
+
+# Bezpieczeństwo i autentykacja
+PyJWT==2.8.0
+bcrypt==4.0.1
+
+# Połączenia SSH/SFTP (dla LibreELEC / Raspberry Pi)
+paramiko==3.3.1
+cryptography>=41.0.0  # wymagane przez paramiko
+
+# HTTP requests (dla komunikacji z API)
+requests==2.31.0
+
+# Zmienne środowiskowe
+python-dotenv==1.0.0
+
+# ============================================
+# Funkcjonalności używane w projekcie:
+# ============================================
+# - Flask: Backend API server
+# - Flask-Cors: Cross-Origin Resource Sharing
+# - PyJWT: Tokeny JWT dla autentykacji
+# - bcrypt: Hashowanie haseł
+# - paramiko: Połączenia SSH/SFTP z urządzeniami LibreELEC
+# - requests: HTTP requests (ipdoapi.py)
+# - python-dotenv: Konfiguracja środowiska
+#
+# Biblioteki standardowe (wbudowane w Python):
+# - sqlite3: Baza danych
+# - os, tempfile, base64, datetime, ftplib, json
+# - subprocess, platform, re, time, functools, stat, typing

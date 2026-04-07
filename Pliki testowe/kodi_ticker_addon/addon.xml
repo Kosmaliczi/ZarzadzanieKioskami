@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="service.ticker" name="Ticker Overlay" version="1.0.1" provider-name="Kiosk System">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
+  <extension point="xbmc.service" library="service.py" start="startup"/>
+  <extension point="xbmc.addon.metadata">
+    <summary lang="pl">Wyświetla ruchomy napis z pliku tekstowego na dole ekranu</summary>
+    <description lang="pl">Automatycznie pobiera plik tekstowy z /storage/napis.txt i wyświetla go jako ruchomy pasek na dole ekranu Kodi. Plik można edytować przez panel WWW.</description>
+    <platform>all</platform>
+    <license>MIT</license>
+  </extension>
+</addon>

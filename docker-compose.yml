@@ -1,0 +1,17 @@
+services:
+  kiosk-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kiosk-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./database:/app/database
+      - ./frontend:/app/frontend
+      - ./backend/ssh_keys:/app/backend/ssh_keys
+    command: ["python", "app.py"]

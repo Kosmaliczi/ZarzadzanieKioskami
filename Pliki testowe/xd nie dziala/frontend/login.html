@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logowanie - System Zarządzania Kioskami</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="css/login.css">
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>System Zarządzania Kioskami</h1>
+                <p>Panel logowania</p>
+            </div>
+            <div class="login-form">
+                <div class="form-group">
+                    <label for="username"><i class="fas fa-user"></i> Nazwa użytkownika</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password"><i class="fas fa-lock"></i> Hasło</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="form-group error-message" id="login-error" style="display: none;">
+                    Nieprawidłowa nazwa użytkownika lub hasło
+                </div>                <div class="form-group">
+                    <button id="login-btn" class="btn primary full-width">Zaloguj się</button>
+                </div>
+                <div class="form-group help-link">
+                    <a href="#" id="show-hint">Nie pamiętasz danych logowania?</a>
+                </div>
+            </div>            <div class="login-footer">
+                <p>© 2025 System Zarządzania Kioskami | <span class="version">Wersja 1.0</span></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/login.js"></script>
+</body>
+</html>
