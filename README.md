@@ -1,13 +1,31 @@
 # Kiosk-reklamowy-Raspi5
 
-System do zdalnego zarządzania kioskami (np. Raspberry Pi) z panelem WWW, backendem API (Flask) i skryptami do wdrożenia na urządzeniach.
+System do zdalnego zarządzania kioskami (np. Raspberry Pi) z panelem WWW, backendem API (Flask), bazą SQLite i skryptami wdrożeniowymi na urządzeniach.
+
+## Co zawiera repozytorium
 
 - Frontend: statyczne HTML/CSS/JS w `frontend/`
 - Backend API: Flask + SQLite w `backend/`
-- Baza danych: `database/` (SQLite + `schema.sql`)
+- Baza danych: `database/` (`schema.sql` i pliki migracji)
 - Skrypty na kiosk: `Do Kiosku/` (systemd, vsftpd, noVNC)
+- Uruchomienie w kontenerach: `Dockerfile`, `docker-compose.yml`
+- Pliki testowe i robocze: `Pliki testowe/` (wykluczone z Dockera przez `.dockerignore`)
 
-## Szybki start (Windows, PowerShell)
+## Szybki start w Dockerze
+
+1) Zbuduj i uruchom środowisko:
+
+```powershell
+docker compose up --build
+```
+
+2) Backend API będzie dostępny na porcie `5000`.
+
+3) Panel WWW jest serwowany przez backend z katalogu `frontend/`.
+
+4) Domyślne konto do logowania to `admin` / `admin`.
+
+## Uruchomienie lokalne (Windows, PowerShell)
 
 1) Zainstaluj Python 3.10+ i pip, a następnie zależności backendu:
 
@@ -15,31 +33,40 @@ System do zdalnego zarządzania kioskami (np. Raspberry Pi) z panelem WWW, backe
 python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r backend/requirements.txt
 ```
 
-2) Uruchom backend API (port domyślnie 5000):
+2) Uruchom backend API:
 
 ```powershell
 python backend/app.py
 ```
 
-3) Otwórz panel WWW: plik `frontend/index.html` (np. przez hosting lokalny) i ustaw adres API w `frontend/js/api.js` oraz `frontend/js/login.js` na IP serwera backendu (domyślnie w kodzie jest wpisany adres sieci lokalnej).
+3) Wejdź na panel WWW przez backend: `http://127.0.0.1:5000/` albo `http://127.0.0.1:5000/login`.
 
-4) Zaloguj się do panelu: domyślny użytkownik to `admin`, hasło `admin` (tworzony automatycznie przy pierwszym uruchomieniu backendu).
+## Konfiguracja i działanie
 
-Więcej szczegółów, endpoints API, instalacja na Raspberry Pi, FTP/VNC oraz bezpieczeństwo znajdziesz w `docs/Dokumentacja Kiosk.md`.
+- Backend używa SQLite w `database/kiosks.db` i inicjalizuje schemat przy starcie.
+- API obsługuje logowanie JWT, zarządzanie kioskami, FTP/SFTP, pliki, rezerwacje i użytkowników.
+- Katalog `backend/ssh_keys/` zawiera klucze SSH używane przez operacje administracyjne.
 
 ## Struktura repozytorium
 
-- `backend/` — Flask API, inicjalizacja bazy, operacje FTP, SSH, JWT
+- `backend/` — Flask API, inicjalizacja bazy, operacje FTP/SFTP, SSH, JWT
 - `frontend/` — panel WWW, logowanie JWT, zarządzanie kioskami, FTP, edytor plików, playlista
 - `database/` — SQLite DB (`kiosks.db`) i schema (`schema.sql`)
 - `Do Kiosku/` — skrypty i jednostki systemd dla urządzenia (raport IP, vsftpd, noVNC)
-- `app.py` — prosty serwer do wyświetlania PDF (niezależny od panelu zarządzania)
+- `kodi_ticker_addon/` — dodatek Kodi dla paska tekstowego
+- `Dockerfile` i `docker-compose.yml` — uruchomienie backendu w kontenerze
 
 ## Wymagania
 
 - Python 3.10+
-- System Windows/Linux dla serwera API
+- System Windows/Linux dla serwera API lub Docker Engine/Compose
 - Sieć lokalna łącząca serwer i kioski
+
+## Dokumentacja
+
+- `docs/Dokumentacja Kiosk.md`
+- `docs/LibreELEC_Konfiguracja.md`
+- `docs/LIBREELEC_QUICKSTART.md`
 
 ## Licencja
 
