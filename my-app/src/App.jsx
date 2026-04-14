@@ -195,8 +195,8 @@ function App() {
 
   const getNavButtonClass = (isActive) => {
     const baseClass = 'btn-lift rounded-xl border px-4 py-2 text-sm font-semibold tracking-wide transition-all duration-200'
-    const activeClass = 'border-blue-900 bg-blue-900 text-white shadow-[0_10px_20px_-12px_rgba(15,23,42,0.75)]'
-    const inactiveClass = 'border-blue-200 bg-white text-blue-900 hover:border-blue-300 hover:bg-blue-50'
+    const activeClass = 'border-slate-600 bg-slate-600 text-white shadow-[0_10px_20px_-12px_rgba(15,23,42,0.75)]'
+    const inactiveClass = 'border-slate-400 bg-slate-200/85 text-slate-900 hover:border-slate-500 hover:bg-slate-300'
 
     return `${baseClass} ${isActive ? activeClass : inactiveClass}`
   }
@@ -206,29 +206,29 @@ function App() {
       <div ref={vantaRef} className="fixed inset-0 z-0" aria-hidden="true" />
       <div className="app-shell relative z-10 mx-auto w-full max-w-7xl px-4 py-6 md:px-6 md:py-8">
         {!isLoggedIn ? (
-          <section className="glass-panel mx-auto max-w-md rounded-2xl border border-blue-100/80 p-7 shadow-[0_16px_45px_-20px_rgba(7,22,56,0.55)]">
-            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-blue-700">Panel kiosku</p>
+          <section className="glass-panel mx-auto max-w-md rounded-2xl border border-slate-300/80 p-7 shadow-[0_16px_45px_-20px_rgba(7,22,56,0.55)]">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-slate-700">Panel kiosku</p>
             <h1 className="mb-5 text-2xl font-semibold text-slate-900">Logowanie</h1>
             <form onSubmit={handleLogin} className="space-y-3">
               <input
                 type="text"
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
-                className="w-full rounded-lg border border-blue-100 bg-white px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                className="w-full rounded-lg border border-slate-300 bg-white/85 px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
                 placeholder="Login"
               />
               <input
                 type="password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
-                className="w-full rounded-lg border border-blue-100 bg-white px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                className="w-full rounded-lg border border-slate-300 bg-white/85 px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
                 placeholder="Hasło"
               />
               {authError ? <p className="text-sm text-red-700">{authError}</p> : null}
               <button
                 type="submit"
                 disabled={isAuthenticating}
-                className="btn-lift w-full rounded-lg border border-blue-900 bg-blue-900 px-3 py-2 font-medium text-white transition-colors hover:bg-blue-800 disabled:opacity-50"
+                className="btn-lift w-full rounded-lg border border-slate-700 bg-slate-700 px-3 py-2 font-medium text-white transition-colors hover:bg-slate-600 disabled:opacity-50"
               >
                 {isAuthenticating ? 'Logowanie...' : 'Zaloguj'}
               </button>
@@ -236,7 +236,7 @@ function App() {
           </section>
         ) : (
           <>
-            <header className="glass-panel -mt-3 mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-blue-100/80 p-3 shadow-[0_12px_32px_-24px_rgba(15,23,42,0.8)]">
+            <header className="glass-panel -mt-3 mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-300/80 p-3 shadow-[0_12px_32px_-24px_rgba(15,23,42,0.8)]">
               <div className="flex flex-wrap gap-2">
                 {navItems.map((item) => (
                   <button
@@ -252,13 +252,13 @@ function App() {
               <button
                 type="button"
                 onClick={handleLogout}
-                className="btn-lift ml-auto rounded-lg border border-blue-200 bg-white px-3 py-2 text-sm font-medium text-blue-900 transition-colors hover:bg-blue-50"
+                className="btn-lift ml-auto rounded-lg border border-slate-400 bg-slate-200/85 px-3 py-2 text-sm font-medium text-slate-900 transition-colors hover:bg-slate-300"
               >
                 Wyloguj
               </button>
             </header>
 
-            <main className="rounded-2xl border border-blue-100/80 bg-white/92 p-3 shadow-[0_20px_40px_-32px_rgba(15,23,42,0.9)] md:p-4">{renderPage()}</main>
+            <main className="rounded-2xl border border-slate-300/80 bg-slate-100/88 p-3 shadow-[0_20px_40px_-32px_rgba(15,23,42,0.9)] md:p-4">{renderPage()}</main>
           </>
         )}
       </div>
