@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kiosk-backend
+    working_dir: /app
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+      - ./database:/database
+    environment:
+      - KIOSK_DATABASE_PATH=/database/kiosks.db
+
+  frontend:
+    build:
+      context: ./my-app
+      dockerfile: Dockerfile
+    container_name: kiosk-frontend
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./my-app:/app
+      - /app/node_modules
+    environment:
+      - VITE_BACKEND_URL=http://backend:5000
+    depends_on:
+      - backend

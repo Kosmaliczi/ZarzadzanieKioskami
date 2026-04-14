@@ -1,0 +1,18 @@
+/* Dodatkowe style dla sekcji SSH */
+.ssh-info {
+    background-color: var(--hover-color);
+    padding: 10px;
+    border-radius: 4px;
+    margin-top: 10px;
+    border-left: 4px solid var(--warning-color);
+}
+
+.ssh-info p {
+    margin: 0;
+    font-size: 0.9em;
+    color: var(--text-color);
+}
+
+.ssh-info strong {
+    color: var(--warning-color);
+}

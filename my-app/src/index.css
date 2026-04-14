@@ -1,0 +1,87 @@
+﻿@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --navy-950: #06122b;
+  --navy-900: #0a1d45;
+  --navy-800: #102a61;
+  --navy-700: #183a79;
+  --ink-900: #0f172a;
+  --ink-700: #334155;
+  --paper: #f4f8ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100svh;
+}
+
+body {
+  margin: 0;
+  color: var(--ink-900);
+  font-family: 'Sora', 'Segoe UI', sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+  letter-spacing: -0.02em;
+}
+
+p {
+  margin: 0;
+}
+
+.app-shell {
+  position: relative;
+  z-index: 2;
+  animation: shell-in 320ms ease-out;
+}
+
+.glass-panel {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(6px);
+}
+
+.btn-lift {
+  transform: translateY(0);
+  transition: transform 180ms ease, box-shadow 180ms ease, filter 180ms ease;
+}
+
+.btn-lift:hover,
+.btn-lift:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 24px -18px rgba(10, 29, 69, 0.8);
+}
+
+.btn-lift:focus-visible {
+  outline: 2px solid rgba(24, 58, 121, 0.4);
+  outline-offset: 2px;
+}
+
+.btn-lift:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+@keyframes shell-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

@@ -1,0 +1,18 @@
+# Framework webowy
+Flask==2.3.3
+Werkzeug==2.3.7
+Flask-Cors==4.0.0
+Django==5.1.6
+
+# Bezpieczeństwo i autentykacja
+PyJWT==2.8.0
+bcrypt==4.0.1
+
+# Połączenia SSH/SFTP
+paramiko==3.3.1
+
+# HTTP requests (dla ipdoapi.py)
+requests==2.31.0
+
+# Zmienne środowiskowe
+python-dotenv==1.0.0
