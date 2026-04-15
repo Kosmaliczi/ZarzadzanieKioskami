@@ -15,20 +15,37 @@ const WAVE_COLORS = [0x36378, 0x153700, 0x637803]
 function App() {
   const auth = useAuth()
   const vantaRef = useRef(null)
+  const initialUser = auth.getCurrentUser()
   const [activePage, setActivePage] = useState('dashboard')
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('admin')
   const [authError, setAuthError] = useState('')
   const [isAuthenticating, setIsAuthenticating] = useState(false)
   const [isLoggedIn, setIsLoggedIn] = useState(auth.isAuthenticated())
+  const [isPasswordChangeRequired, setIsPasswordChangeRequired] = useState(Boolean(initialUser?.mustChangePassword))
+  const [currentPasswordForChange, setCurrentPasswordForChange] = useState('')
+  const [newPasswordForChange, setNewPasswordForChange] = useState('')
+  const [confirmPasswordForChange, setConfirmPasswordForChange] = useState('')
+  const [passwordChangeError, setPasswordChangeError] = useState('')
+  const [isChangingPassword, setIsChangingPassword] = useState(false)
 
   const handleLogin = async (event) => {
     event.preventDefault()
     setAuthError('')
     setIsAuthenticating(true)
     try {
-      await auth.login({ username, password })
+      const loginPassword = password
+      const loginResult = await auth.login({ username, password })
       setIsLoggedIn(true)
+
+      if (loginResult?.user?.mustChangePassword) {
+        setIsPasswordChangeRequired(true)
+        setCurrentPasswordForChange(loginPassword)
+      } else {
+        setIsPasswordChangeRequired(false)
+        setCurrentPasswordForChange('')
+      }
+
       setPassword('')
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'Błąd logowania')
@@ -40,6 +57,39 @@ function App() {
   const handleLogout = async () => {
     await auth.logout()
     setIsLoggedIn(false)
+    setIsPasswordChangeRequired(false)
+    setCurrentPasswordForChange('')
+    setNewPasswordForChange('')
+    setConfirmPasswordForChange('')
+    setPasswordChangeError('')
+  }
+
+  const handleForcedPasswordChange = async (event) => {
+    event.preventDefault()
+    setPasswordChangeError('')
+
+    if (!newPasswordForChange || newPasswordForChange.length < 6) {
+      setPasswordChangeError('Nowe hasło musi mieć co najmniej 6 znaków')
+      return
+    }
+
+    if (newPasswordForChange !== confirmPasswordForChange) {
+      setPasswordChangeError('Nowe hasła do siebie nie pasują')
+      return
+    }
+
+    setIsChangingPassword(true)
+    try {
+      await auth.changePassword(currentPasswordForChange, newPasswordForChange, confirmPasswordForChange)
+      setIsPasswordChangeRequired(false)
+      setCurrentPasswordForChange('')
+      setNewPasswordForChange('')
+      setConfirmPasswordForChange('')
+    } catch (error) {
+      setPasswordChangeError(error instanceof Error ? error.message : 'Błąd zmiany hasła')
+    } finally {
+      setIsChangingPassword(false)
+    }
   }
 
   useEffect(() => {
@@ -201,6 +251,8 @@ function App() {
     return `${baseClass} ${isActive ? activeClass : inactiveClass}`
   }
 
+  const loggedInUser = auth.getCurrentUser()
+
   return (
     <div className="relative min-h-screen">
       <div ref={vantaRef} className="fixed inset-0 z-0" aria-hidden="true" />
@@ -234,6 +286,50 @@ function App() {
               </button>
             </form>
           </section>
+        ) : isPasswordChangeRequired ? (
+          <section className="glass-panel mx-auto max-w-md rounded-2xl border border-slate-300/80 p-7 shadow-[0_16px_45px_-20px_rgba(7,22,56,0.55)]">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-slate-700">Bezpieczenstwo konta</p>
+            <h1 className="mb-2 text-2xl font-semibold text-slate-900">Wymagana zmiana hasla</h1>
+            <p className="mb-5 text-sm text-slate-700">
+              Uzytkownik <strong>{loggedInUser?.username || username}</strong> musi zmienic haslo przy pierwszym logowaniu.
+            </p>
+
+            <form onSubmit={handleForcedPasswordChange} className="space-y-3">
+              <input
+                type="password"
+                value={newPasswordForChange}
+                onChange={(event) => setNewPasswordForChange(event.target.value)}
+                className="w-full rounded-lg border border-slate-300 bg-white/85 px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
+                placeholder="Nowe haslo"
+              />
+              <input
+                type="password"
+                value={confirmPasswordForChange}
+                onChange={(event) => setConfirmPasswordForChange(event.target.value)}
+                className="w-full rounded-lg border border-slate-300 bg-white/85 px-3 py-2 text-slate-900 placeholder:text-slate-500 focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
+                placeholder="Potwierdz nowe haslo"
+              />
+
+              {passwordChangeError ? <p className="text-sm text-red-700">{passwordChangeError}</p> : null}
+
+              <div className="flex gap-3">
+                <button
+                  type="submit"
+                  disabled={isChangingPassword}
+                  className="btn-lift flex-1 rounded-lg border border-slate-700 bg-slate-700 px-3 py-2 font-medium text-white transition-colors hover:bg-slate-600 disabled:opacity-50"
+                >
+                  {isChangingPassword ? 'Zapisywanie...' : 'Zmien haslo'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="btn-lift rounded-lg border border-slate-400 bg-slate-200/85 px-3 py-2 text-sm font-medium text-slate-900 transition-colors hover:bg-slate-300"
+                >
+                  Wyloguj
+                </button>
+              </div>
+            </form>
+          </section>
         ) : (
           <>
             <header className="glass-panel -mt-3 mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-300/80 p-3 shadow-[0_12px_32px_-24px_rgba(15,23,42,0.8)]">
@@ -249,13 +345,20 @@ function App() {
                   </button>
                 ))}
               </div>
-              <button
-                type="button"
-                onClick={handleLogout}
-                className="btn-lift ml-auto rounded-lg border border-slate-400 bg-slate-200/85 px-3 py-2 text-sm font-medium text-slate-900 transition-colors hover:bg-slate-300"
-              >
-                Wyloguj
-              </button>
+              <div className="ml-auto flex items-center gap-3">
+                {loggedInUser && (
+                  <span className="text-sm text-slate-700">
+                    Zalogowany jako: <strong>{loggedInUser.username}</strong>
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="btn-lift rounded-lg border border-slate-400 bg-slate-200/85 px-3 py-2 text-sm font-medium text-slate-900 transition-colors hover:bg-slate-300"
+                >
+                  Wyloguj
+                </button>
+              </div>
             </header>
 
             <main className="rounded-2xl border border-slate-300/80 bg-slate-100/88 p-3 shadow-[0_20px_40px_-32px_rgba(15,23,42,0.9)] md:p-4">{renderPage()}</main>

@@ -22,6 +22,7 @@ export class AuthService {
         success: boolean
         username: string
         role: 'user' | 'admin'
+        must_change_password?: boolean
         token: string
         message?: string
       }>(
@@ -47,6 +48,7 @@ export class AuthService {
           id: null,
           username: response.username,
           role: response.role || 'user',
+          mustChangePassword: Boolean(response.must_change_password),
         },
         expiresIn,
       }
@@ -132,6 +134,23 @@ export class AuthService {
         },
         { timeout: 10000 }
       )
+
+      // Po udanej zmianie hasła przy pierwszym logowaniu zdejmij lokalną flagę wymuszenia.
+      try {
+        const stored = localStorage.getItem('user')
+        if (stored) {
+          const user = JSON.parse(stored)
+          localStorage.setItem(
+            'user',
+            JSON.stringify({
+              ...user,
+              mustChangePassword: false,
+            })
+          )
+        }
+      } catch {
+        // Ignoruj błąd parse localStorage; nie blokuje to zmiany hasła.
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Błąd zmiany hasła'
       throw new Error(message)
@@ -161,5 +180,25 @@ export class AuthService {
 
     const remaining = token.expiresAt - Date.now()
     return remaining > 0 ? remaining : 0
+  }
+
+  /**
+   * Get current logged-in user
+   */
+  getCurrentUser(): { username: string; role: 'user' | 'admin'; mustChangePassword: boolean } | null {
+    try {
+      const stored = localStorage.getItem('user')
+      if (!stored) return null
+      const user = JSON.parse(stored)
+      if (!user) return null
+
+      return {
+        username: user.username,
+        role: user.role || 'user',
+        mustChangePassword: Boolean(user.mustChangePassword),
+      }
+    } catch {
+      return null
+    }
   }
 }

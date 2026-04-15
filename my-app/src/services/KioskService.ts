@@ -10,6 +10,7 @@ import type {
   UpdateKioskRequest,
   KioskRestartServiceRequest,
   KioskRotateDisplayResponse,
+  KioskOrientationFileResponse,
 } from '../types/api'
 
 export class KioskService {
@@ -150,6 +151,9 @@ export class KioskService {
     ip_address: string | null
     ftp_username: string
     ftp_password: string
+    media_path?: string | null
+    text_file_path?: string | null
+    playlist_target_file?: string | null
   }> {
     try {
       const credentials = await this.httpClient.get<{
@@ -158,6 +162,9 @@ export class KioskService {
         ip_address: string | null
         ftp_username: string
         ftp_password: string
+        media_path?: string | null
+        text_file_path?: string | null
+        playlist_target_file?: string | null
       }>(
         `/api/kiosks/${kioskId}/ftp-credentials`,
         { timeout: 10000 }
@@ -221,6 +228,40 @@ export class KioskService {
         throw error
       }
       throw new Error('Błąd obracania ekranu')
+    }
+  }
+
+  async writeOrientationFile(kioskId: number, orientation: string): Promise<KioskOrientationFileResponse> {
+    try {
+      const result = await this.httpClient.post<KioskOrientationFileResponse>(
+        `/api/kiosks/${kioskId}/orientation-file`,
+        { orientation },
+        { timeout: 20000 }
+      )
+
+      if (!result) {
+        throw new Error('Invalid response from server')
+      }
+
+      return result
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error
+      }
+      throw new Error('Błąd zapisu pliku orientacji')
+    }
+  }
+
+  async getTickerOrientation(): Promise<string> {
+    try {
+      const result = await this.httpClient.get<{ orientation?: string }>(
+        '/api/ticker-orientation',
+        { timeout: 10000 }
+      )
+
+      return String(result?.orientation || 'normal').toLowerCase()
+    } catch {
+      return 'normal'
     }
   }
 

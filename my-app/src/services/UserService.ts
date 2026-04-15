@@ -9,6 +9,10 @@ import type {
   CreateUserRequest,
   UpdateUserRoleRequest,
   ChangePasswordRequest,
+  PermissionsCatalogResponse,
+  UserPermissionsResponse,
+  UpdateUserPermissionsRequest,
+  UpdateUserPermissionsResponse,
 } from '../types/api'
 
 export class UserService {
@@ -150,6 +154,61 @@ export class UserService {
       )
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Błąd zmiany hasła użytkownika'
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Get available action permissions catalog (admin or users.manage)
+   */
+  async getPermissionsCatalog(): Promise<Array<{ key: string; label: string }>> {
+    try {
+      const response = await this.httpClient.get<PermissionsCatalogResponse>(
+        '/api/permissions/catalog',
+        { cache: true, cacheTime: 60000 }
+      )
+      return response?.actions || []
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Błąd pobierania katalogu uprawnień'
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Get action permissions for specific user
+   */
+  async getUserPermissions(userId: number): Promise<Record<string, boolean>> {
+    try {
+      const response = await this.httpClient.get<UserPermissionsResponse>(
+        `/api/users/${userId}/permissions`,
+        { timeout: 10000 }
+      )
+      return response?.permissions || {}
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Błąd pobierania uprawnień użytkownika'
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Update action permissions for specific user
+   */
+  async updateUserPermissions(userId: number, permissions: Record<string, boolean>): Promise<Record<string, boolean>> {
+    try {
+      const response = await this.httpClient.put<UpdateUserPermissionsResponse>(
+        `/api/users/${userId}/permissions`,
+        { permissions } as UpdateUserPermissionsRequest,
+        { timeout: 15000 }
+      )
+
+      if (!response?.success) {
+        throw new Error('Nie udało się zapisać uprawnień użytkownika')
+      }
+
+      this.httpClient.clearCache()
+      return response.permissions || {}
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Błąd aktualizacji uprawnień użytkownika'
       throw new Error(message)
     }
   }

@@ -47,6 +47,7 @@ export interface LoginResponse {
     id: number | null
     username: string
     role: 'user' | 'admin'
+    mustChangePassword: boolean
   }
   expiresIn: number
 }
@@ -69,6 +70,9 @@ export interface Kiosk {
   ip_address: string | null
   ftp_username: string
   ftp_password: string
+  media_path?: string | null
+  text_file_path?: string | null
+  playlist_target_file?: string | null
   status: 'online' | 'offline'
   last_connection: string
   created_at: string
@@ -81,6 +85,9 @@ export interface CreateKioskRequest {
   serial_number: string
   ftp_username: string
   ftp_password: string
+  media_path?: string
+  text_file_path?: string
+  playlist_target_file?: string
 }
 
 export interface UpdateKioskRequest {
@@ -89,6 +96,9 @@ export interface UpdateKioskRequest {
   serial_number?: string
   ftp_username?: string
   ftp_password?: string
+  media_path?: string
+  text_file_path?: string
+  playlist_target_file?: string
 }
 
 // ============================================================================
@@ -100,11 +110,14 @@ export interface FtpConnectionRequest {
   username: string
   password: string
   port?: number
+  kioskId?: number
 }
 
 export interface FtpConnectionResponse {
-  success: boolean
+  success?: boolean
   protocol: 'ftp' | 'sftp'
+  port?: number
+  fallback?: boolean
   message: string
 }
 
@@ -168,6 +181,53 @@ export interface FtpMkdirRequest extends FtpConnectionRequest {
 
 export interface FtpDownloadRequest extends FtpConnectionRequest {
   path: string
+}
+
+// ============================================================================
+// Playlist Types
+// ============================================================================
+
+export interface PlaylistItem {
+  id?: number
+  position?: number
+  path: string
+  name: string
+  type: 'file' | 'directory'
+  size?: number
+  displayFrequency?: number
+}
+
+export interface KioskPlaylist {
+  id: number
+  kiosk_id: number
+  name: string
+  order_mode?: 'manual' | 'name_asc' | 'name_desc' | 'random'
+  targetFile?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface GetPlaylistResponse {
+  playlist: KioskPlaylist
+  items: PlaylistItem[]
+}
+
+export interface SavePlaylistRequest {
+  name?: string
+  orderMode?: 'manual' | 'name_asc' | 'name_desc' | 'random'
+  targetFile?: string
+  items: PlaylistItem[]
+}
+
+export interface SavePlaylistResponse {
+  message: string
+  playlistId: number
+  itemsCount: number
+  orderMode?: 'manual' | 'name_asc' | 'name_desc' | 'random'
+  targetFile?: string
+  synced?: boolean
+  syncPort?: number
+  syncError?: string
 }
 
 // ============================================================================
@@ -244,6 +304,7 @@ export interface User {
   id: number
   username: string
   role: 'user' | 'admin'
+  must_change_password?: boolean
   created_at: string
   updated_at: string
 }
@@ -266,6 +327,37 @@ export interface ChangePasswordRequest {
   confirm_password?: string
 }
 
+export interface ActionPermissionItem {
+  key: string
+  label: string
+}
+
+export interface PermissionsCatalogResponse {
+  success: boolean
+  actions: ActionPermissionItem[]
+}
+
+export interface UserPermissionsResponse {
+  success: boolean
+  user: {
+    id: number
+    username: string
+    role: 'admin' | 'user'
+  }
+  permissions: Record<string, boolean>
+}
+
+export interface UpdateUserPermissionsRequest {
+  permissions: Record<string, boolean>
+}
+
+export interface UpdateUserPermissionsResponse {
+  success: boolean
+  message: string
+  user_id: number
+  permissions: Record<string, boolean>
+}
+
 // ============================================================================
 // Kiosk Device Types
 // ============================================================================
@@ -278,6 +370,7 @@ export interface UpdateDeviceIpRequest {
 export interface KioskRestartServiceRequest {
   username?: string
   port?: number
+  password?: string
 }
 
 export interface KioskRotateDisplayRequest {
@@ -288,6 +381,19 @@ export interface KioskRotateDisplayResponse {
   success: boolean
   message: string
   orientation: string
+  fallbackApplied?: boolean
+  orientationFile?: string
+  orientationFilePort?: number
+  orientationFileError?: string | null
+}
+
+export interface KioskOrientationFileResponse {
+  success: boolean
+  message: string
+  orientation: string
+  orientationFile: string
+  orientationFilePort?: number
+  warning?: string | null
 }
 
 // ============================================================================

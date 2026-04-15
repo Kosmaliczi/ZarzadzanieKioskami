@@ -15,6 +15,8 @@ vi.mock('../src/hooks', () => ({
     isAuthenticated: () => false,
     login: vi.fn().mockResolvedValue({}),
     logout: vi.fn().mockResolvedValue({}),
+    changePassword: vi.fn().mockResolvedValue({}),
+    getCurrentUser: () => null,
   }),
 }))
 

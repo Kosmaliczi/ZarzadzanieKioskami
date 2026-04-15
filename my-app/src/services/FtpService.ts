@@ -27,6 +27,49 @@ export class FtpService {
     this.httpClient = httpClient
   }
 
+  private normalizeFtpFile(file: Record<string, unknown>): FtpFile {
+    const isDirectory = Boolean(file.isDirectory ?? file.is_directory)
+    return {
+      name: String(file.name ?? ''),
+      path: String(file.path ?? ''),
+      type: isDirectory ? 'directory' : 'file',
+      size: Number(file.size ?? 0),
+      modified: String(file.modified ?? ''),
+      permissions: file.permissions ? String(file.permissions) : undefined,
+    }
+  }
+
+  private normalizeListResponse(response: unknown, fallbackPath: string): FtpListResponse {
+    if (Array.isArray(response)) {
+      return {
+        files: response
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          .map((item) => this.normalizeFtpFile(item)),
+        currentPath: fallbackPath,
+      }
+    }
+
+    if (response && typeof response === 'object') {
+      const obj = response as Record<string, unknown>
+      const rawFiles = Array.isArray(obj.files) ? obj.files : []
+      const currentPath = typeof obj.currentPath === 'string' ? obj.currentPath : fallbackPath
+      const parent = typeof obj.parent === 'string' ? obj.parent : undefined
+
+      return {
+        files: rawFiles
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          .map((item) => this.normalizeFtpFile(item)),
+        currentPath,
+        parent,
+      }
+    }
+
+    return {
+      files: [],
+      currentPath: fallbackPath,
+    }
+  }
+
   /**
    * Test FTP connection
    */
@@ -54,17 +97,17 @@ export class FtpService {
    */
   async listFiles(request: FtpListRequest): Promise<FtpListResponse> {
     try {
-      const response = await this.httpClient.post<FtpListResponse>(
+      const response = await this.httpClient.post<unknown>(
         '/api/ftp/files',
         request,
         { timeout: 20000 }
       )
 
-      if (!response) {
+      if (response == null) {
         throw new Error('Failed to list files')
       }
 
-      return response
+      return this.normalizeListResponse(response, request.path)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Błąd pobierania listy plików'
       throw new Error(message)

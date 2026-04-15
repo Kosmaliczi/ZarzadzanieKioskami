@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ui } from './uiClasses'
 import { useAsync, useMutation, useFtp, useKiosks } from '../hooks'
 
@@ -7,22 +7,61 @@ export default function TextEditor() {
   const ftpService = useFtp()
 
   const [selectedKioskId, setSelectedKioskId] = useState('')
-  const [filePath, setFilePath] = useState('napis.txt')
+  const [filePath, setFilePath] = useState('/storage/napis.txt')
   const [content, setContent] = useState('')
   const [connection, setConnection] = useState({ hostname: '', username: '', password: '', port: 21 })
+  const [actionInfo, setActionInfo] = useState('')
 
   const { data: kiosks } = useAsync(() => kioskService.getKiosks())
+
+  const getDefaultTextPath = (kiosk, port) => {
+    const custom = (kiosk?.text_file_path || '').trim()
+    if (custom) {
+      return custom
+    }
+    return Number(port) === 22 ? '/storage/napis.txt' : 'napis.txt'
+  }
+
+  useEffect(() => {
+    const kioskId = Number(selectedKioskId)
+    if (!kioskId) {
+      return
+    }
+
+    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    if (!selectedKiosk) {
+      return
+    }
+
+    setFilePath(getDefaultTextPath(selectedKiosk, Number(connection.port || 21)))
+  }, [selectedKioskId, kiosks])
 
   const connectMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
     const credentials = await kioskService.getFtpCredentials(kioskId)
-    const next = {
+    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const base = {
       hostname: credentials.ip_address || '',
       username: credentials.ftp_username || 'root',
       password: credentials.ftp_password || '',
       port: 21,
+      kioskId,
     }
+
+    const result = await ftpService.testConnection(base)
+    const resolvedPort = Number(result.port || 21)
+    const next = { ...base, port: resolvedPort }
     setConnection(next)
+
+    setFilePath((currentPath) => {
+      const normalized = String(currentPath || '').trim()
+      if (!normalized || normalized === 'napis.txt' || normalized === '/home/kiosk/MediaPionowe/napis.txt') {
+        return getDefaultTextPath(selectedKiosk, resolvedPort)
+      }
+      return currentPath
+    })
+
+    setActionInfo(`Połączono przez ${String(result.protocol || 'ftp').toUpperCase()}:${resolvedPort}`)
     return next
   })
 
@@ -30,6 +69,7 @@ export default function TextEditor() {
     const text = await ftpService.getFileContent({
       ...connection,
       path: filePath,
+      kioskId: Number(selectedKioskId),
     })
     setContent(text)
     return text
@@ -40,6 +80,7 @@ export default function TextEditor() {
       ...connection,
       path: filePath,
       content,
+      kioskId: Number(selectedKioskId),
     })
   })
 
@@ -75,6 +116,7 @@ export default function TextEditor() {
         {connectMutation.error ? <p className="text-sm text-red-600">{connectMutation.error.message}</p> : null}
         {loadMutation.error ? <p className="text-sm text-red-600">{loadMutation.error.message}</p> : null}
         {saveMutation.error ? <p className="text-sm text-red-600">{saveMutation.error.message}</p> : null}
+        {actionInfo ? <p className="text-sm text-blue-700">{actionInfo}</p> : null}
       </div>
     </section>
   )

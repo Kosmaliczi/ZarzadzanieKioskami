@@ -9,20 +9,49 @@ export default function Ftp() {
   const [connection, setConnection] = useState({ hostname: '', username: '', password: '', port: 21 })
   const [path, setPath] = useState('/')
   const [files, setFiles] = useState([])
+  const [connectionInfo, setConnectionInfo] = useState('')
+
+  const getDefaultMediaPath = (kiosk, port) => {
+    const custom = (kiosk?.media_path || '').trim()
+    if (custom) {
+      return custom
+    }
+    return Number(port) === 22 ? '/storage/videos' : '/home/kiosk/MediaPionowe'
+  }
 
   const { data: kiosks } = useAsync(() => kioskService.getKiosks())
 
   const connectMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
     const credentials = await kioskService.getFtpCredentials(kioskId)
-    const next = {
+    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const draft = {
       hostname: credentials.ip_address || '',
       username: credentials.ftp_username || 'root',
       password: credentials.ftp_password || '',
       port: 21,
+      kioskId,
+    }
+    const connectionResult = await ftpService.testConnection(draft)
+    const resolvedPort = Number(connectionResult.port || draft.port || 21)
+    const next = {
+      ...draft,
+      port: resolvedPort,
     }
     setConnection(next)
-    await ftpService.testConnection(next)
+
+    if (connectionResult.fallback) {
+      setConnectionInfo(`Automatycznie przełączono na ${String(connectionResult.protocol).toUpperCase()}:${resolvedPort}`)
+      if (path === '/') {
+        setPath(getDefaultMediaPath(selectedKiosk, resolvedPort))
+      }
+    } else {
+      setConnectionInfo(`Połączono przez ${String(connectionResult.protocol || 'ftp').toUpperCase()}:${resolvedPort}`)
+      if (path === '/' || !path.trim()) {
+        setPath(getDefaultMediaPath(selectedKiosk, resolvedPort))
+      }
+    }
+
     return next
   })
 
@@ -34,11 +63,17 @@ export default function Ftp() {
 
   const handleConnect = async () => {
     const next = await connectMutation.execute()
-    await listMutation.execute({ ...next, path })
+    const kioskId = Number(selectedKioskId)
+    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const effectivePath = path.trim() || getDefaultMediaPath(selectedKiosk, next.port)
+    if (!path.trim()) {
+      setPath(effectivePath)
+    }
+    await listMutation.execute({ ...next, path: effectivePath, kioskId })
   }
 
   const handleList = async () => {
-    await listMutation.execute({ ...connection, path })
+    await listMutation.execute({ ...connection, path, kioskId: Number(selectedKioskId) || undefined })
   }
 
   return (
@@ -64,6 +99,7 @@ export default function Ftp() {
       </div>
 
       {connectMutation.error ? <p className="text-sm text-red-600">{connectMutation.error.message}</p> : null}
+      {connectionInfo ? <p className="text-sm text-blue-700">{connectionInfo}</p> : null}
       {listMutation.error ? <p className="text-sm text-red-600">{listMutation.error.message}</p> : null}
 
       <div className={ui.tableWrap}>

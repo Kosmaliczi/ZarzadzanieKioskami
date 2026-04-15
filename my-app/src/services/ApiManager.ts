@@ -12,6 +12,7 @@ import { FtpService } from './FtpService'
 import { ReservationService } from './ReservationService'
 import { UserService } from './UserService'
 import { SettingsService } from './SettingsService'
+import { PlaylistService } from './PlaylistService'
 
 export class ApiManager {
   private httpClient: HttpClient
@@ -21,6 +22,7 @@ export class ApiManager {
   public reservations: ReservationService
   public users: UserService
   public settings: SettingsService
+  public playlists: PlaylistService
 
   constructor(baseUrl: string = API_BASE_URL) {
     // Create HTTP client with default configuration
@@ -33,6 +35,7 @@ export class ApiManager {
     this.reservations = new ReservationService(this.httpClient)
     this.users = new UserService(this.httpClient)
     this.settings = new SettingsService(this.httpClient)
+    this.playlists = new PlaylistService(this.httpClient)
   }
 
   /**

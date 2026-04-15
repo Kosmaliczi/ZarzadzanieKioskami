@@ -6,7 +6,7 @@ services:
     container_name: kiosk-backend
     working_dir: /app
     ports:
-      - "5000:5000"
+      - "0.0.0.0:5000:5000"
     volumes:
       - ./backend:/app
       - ./database:/database
@@ -20,7 +20,7 @@ services:
     container_name: kiosk-frontend
     working_dir: /app
     ports:
-      - "5173:5173"
+      - "0.0.0.0:5173:5173"
     volumes:
       - ./my-app:/app
       - /app/node_modules

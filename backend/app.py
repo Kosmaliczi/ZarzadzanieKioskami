@@ -1,4 +1,5 @@
 import os
+import posixpath
 import sqlite3
 import datetime
 import uuid
@@ -10,6 +11,7 @@ import ftplib
 from dotenv import load_dotenv
 import tempfile
 import base64
+import io
 import jwt
 import bcrypt
 from functools import wraps
@@ -21,6 +23,16 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+ACTION_PERMISSION_CATALOG = {
+    'kiosk.manage': 'Zarządzanie kioskami (dodaj/edytuj/usuń)',
+    'kiosk.paths': 'Edycja ścieżek kiosku',
+    'kiosk.restart': 'Restart usługi kiosku',
+    'kiosk.rotate': 'Obrót ekranu / orientacji kiosku',
+    'playlist.save': 'Zapis i synchronizacja playlisty',
+    'settings.manage': 'Zarządzanie ustawieniami systemu',
+    'users.manage': 'Zarządzanie użytkownikami i rolami',
+}
 
 # Klucz do szyfrowania/deszyfrowania (powinien być taki sam jak w pliku config.js)
 ENCRYPTION_KEY = 'kiosk-manager-secure-key-2025'
@@ -109,8 +121,96 @@ def init_db():
             conn.execute("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'user'")
             conn.commit()
             app.logger.info("Kolumna 'role' dodana pomyślnie")
+
+        if 'must_change_password' not in columns:
+            app.logger.info("Dodawanie kolumny 'must_change_password' do tabeli users...")
+            conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+            app.logger.info("Kolumna 'must_change_password' dodana pomyślnie")
     except Exception as e:
         app.logger.error(f"Błąd podczas migracji bazy danych: {str(e)}")
+
+    # Migracja: tabele playlist
+    try:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kiosk_id INTEGER NOT NULL,
+                name VARCHAR(120) NOT NULL DEFAULT 'Default',
+                order_mode VARCHAR(20) NOT NULL DEFAULT 'manual',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(kiosk_id, name),
+                FOREIGN KEY(kiosk_id) REFERENCES kiosks(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_playlists_kiosk ON playlists(kiosk_id)')
+
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS playlist_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_type VARCHAR(20) DEFAULT 'file',
+                file_size INTEGER DEFAULT 0,
+                display_frequency INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist ON playlist_items(playlist_id, position)')
+
+        playlist_columns = [column[1] for column in conn.execute('PRAGMA table_info(playlists)').fetchall()]
+        if 'order_mode' not in playlist_columns:
+            conn.execute("ALTER TABLE playlists ADD COLUMN order_mode VARCHAR(20) NOT NULL DEFAULT 'manual'")
+
+        playlist_item_columns = [column[1] for column in conn.execute('PRAGMA table_info(playlist_items)').fetchall()]
+        if 'display_frequency' not in playlist_item_columns:
+            conn.execute('ALTER TABLE playlist_items ADD COLUMN display_frequency INTEGER NOT NULL DEFAULT 1')
+
+        conn.commit()
+    except Exception as e:
+        app.logger.error(f"Błąd podczas migracji tabel playlist: {str(e)}")
+
+    # Migracja: konfigurowalne ścieżki per kiosk.
+    try:
+        kiosk_columns = [column[1] for column in conn.execute('PRAGMA table_info(kiosks)').fetchall()]
+        if 'media_path' not in kiosk_columns:
+            conn.execute("ALTER TABLE kiosks ADD COLUMN media_path TEXT")
+        if 'text_file_path' not in kiosk_columns:
+            conn.execute("ALTER TABLE kiosks ADD COLUMN text_file_path TEXT")
+        if 'playlist_target_file' not in kiosk_columns:
+            conn.execute("ALTER TABLE kiosks ADD COLUMN playlist_target_file TEXT")
+        conn.commit()
+    except Exception as e:
+        app.logger.error(f"Błąd podczas migracji ścieżek kiosku: {str(e)}")
+
+    # Migracja: uprawnienia akcji per użytkownik.
+    try:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS user_action_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                allowed INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, action),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_user_action_permissions_user ON user_action_permissions(user_id, action)')
+        conn.commit()
+    except Exception as e:
+        app.logger.error(f"Błąd podczas migracji uprawnień akcji użytkowników: {str(e)}")
     finally:
         conn.close()
 
@@ -189,6 +289,14 @@ def token_required(f):
             # Zapisz username i rolę w Flask g dla dostępu w endpointach
             g.current_user = user['username']
             g.current_user_role = user['role'] or 'user'
+            g.current_user_must_change_password = bool(user['must_change_password']) if 'must_change_password' in user.keys() else False
+
+            # Wymuś zmianę hasła po pierwszym logowaniu.
+            if g.current_user_must_change_password and request.path != '/api/account/change-password':
+                return jsonify({
+                    'message': 'Wymagana zmiana hasła przed dalszym korzystaniem z systemu',
+                    'must_change_password': True,
+                }), 403
         except jwt.ExpiredSignatureError:
             return jsonify({'message': 'Token wygasł'}), 401
         except jwt.InvalidTokenError:
@@ -236,6 +344,47 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def has_user_action_permission(username, action):
+    if not username or not action:
+        return False
+
+    conn = get_db_connection()
+    try:
+        user = conn.execute('SELECT id, role FROM users WHERE username = ?', (username,)).fetchone()
+        if not user:
+            return False
+
+        if (user['role'] or 'user') == 'admin':
+            return True
+
+        permission = conn.execute(
+            'SELECT allowed FROM user_action_permissions WHERE user_id = ? AND action = ?',
+            (user['id'], action)
+        ).fetchone()
+        return bool(permission and int(permission['allowed']) == 1)
+    finally:
+        conn.close()
+
+
+def action_permission_required(action):
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if action not in ACTION_PERMISSION_CATALOG:
+                return jsonify({'message': f'Nieznana akcja uprawnień: {action}'}), 500
+
+            current_username = getattr(g, 'current_user', None)
+            if not current_username:
+                return jsonify({'message': 'Brak kontekstu użytkownika'}), 401
+
+            if not has_user_action_permission(current_username, action):
+                return jsonify({'message': f'Brak uprawnień do akcji: {action}'}), 403
+
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
 # Endpoint do weryfikacji danych logowania
 @app.route('/api/auth/login', methods=['POST'])
 def verify_login():
@@ -251,16 +400,19 @@ def verify_login():
     user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
     conn.close()
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+        must_change_password = bool(user['must_change_password']) if 'must_change_password' in user.keys() else False
         # Generowanie tokenu JWT zawierającego rolę
         token = jwt.encode({
             'username': username,
             'role': user['role'] or 'user',
+            'must_change_password': must_change_password,
             'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
         }, JWT_SECRET_KEY, algorithm="HS256")
         return jsonify({
             "success": True,
             "username": username,
             "role": user['role'] or 'user',
+            "must_change_password": must_change_password,
             "token": token,
             "message": "Logowanie pomyślne"
         })
@@ -275,10 +427,24 @@ def init_default_user():
     user_count = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
     if user_count == 0:
         conn.execute(
-            'INSERT INTO users (username, password) VALUES (?, ?)',
-            ('admin', bcrypt.hashpw('admin'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'))  # W produkcji powinno być używane hashowanie haseł
+            'INSERT INTO users (username, password, role, must_change_password) VALUES (?, ?, ?, ?)',
+            (
+                'admin',
+                bcrypt.hashpw('admin'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+                'admin',
+                0,
+            )  # W produkcji powinno być używane hashowanie haseł
         )
         conn.commit()
+
+    # Kompatybilność wsteczna: jeśli konto admin istnieje, wymuś rolę admin.
+    conn.execute(
+        "UPDATE users SET role = 'admin' WHERE username = 'admin' AND (role IS NULL OR role != 'admin')"
+    )
+    conn.execute(
+        "UPDATE users SET must_change_password = 0 WHERE username = 'admin' AND (must_change_password IS NULL OR must_change_password != 0)"
+    )
+    conn.commit()
     
     conn.close()
 
@@ -287,6 +453,82 @@ init_default_user()
 
 # Ścieżka do klucza SSH dla SFTP (LibreELEC)
 SSH_KEY_PATH = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa')
+
+
+def build_ssh_username_candidates(kiosk, settings_dict, request_data=None):
+    candidates = []
+
+    if request_data:
+        requested_username = (request_data.get('username') or '').strip()
+        if requested_username:
+            candidates.append(requested_username)
+
+    kiosk_username = (kiosk['ftp_username'] or '').strip() if 'ftp_username' in kiosk.keys() else ''
+    if kiosk_username:
+        candidates.append(kiosk_username)
+
+    default_username = (settings_dict.get('defaultSshUsername') or '').strip()
+    if default_username:
+        candidates.append(default_username)
+
+    candidates.extend(['kiosk', 'root'])
+
+    unique_candidates = []
+    seen = set()
+    for username in candidates:
+        if username and username not in seen:
+            unique_candidates.append(username)
+            seen.add(username)
+
+    return unique_candidates
+
+
+def connect_ssh_with_username_fallback(hostname, port, username_candidates, key_path, password=None):
+    import paramiko
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        private_key = paramiko.RSAKey.from_private_key_file(key_path)
+    except Exception as key_error:
+        raise Exception(f"Błąd podczas ładowania klucza SSH: {str(key_error)}") from key_error
+
+    last_error = None
+
+    for username in username_candidates:
+        try:
+            ssh.connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                pkey=private_key,
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return ssh, username
+        except Exception as auth_error:
+            last_error = auth_error
+
+    if password:
+        for username in username_candidates:
+            try:
+                ssh.connect(
+                    hostname=hostname,
+                    port=port,
+                    username=username,
+                    password=password,
+                    timeout=10,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+                return ssh, username
+            except Exception as auth_error:
+                last_error = auth_error
+
+    ssh.close()
+    raise last_error or Exception('Nie udało się uwierzytelnić przez SSH')
 
 # Funkcja określająca protokół na podstawie portu
 def get_protocol(port):
@@ -299,13 +541,117 @@ def get_protocol(port):
     """
     return 'sftp' if port == 22 else 'ftp'
 
+
+def get_default_media_path(port):
+    # LibreELEC / Kodi: media domyślnie w /storage/videos (SFTP, port 22)
+    return '/storage/videos' if port == 22 else '/home/kiosk/MediaPionowe'
+
+
+def get_default_text_file_path(port):
+    # LibreELEC / Kodi lokalnie używa /storage/napis.txt
+    return '/storage/napis.txt' if port == 22 else 'napis.txt'
+
+
+def normalize_optional_path(value):
+    text = str(value or '').strip()
+    return text if text else None
+
+
+def get_kiosk_path_setting(kiosk_row, key):
+    if not kiosk_row:
+        return None
+    try:
+        return normalize_optional_path(kiosk_row[key])
+    except Exception:
+        return None
+
+
+def build_playlist_target_from_media_path(media_path):
+    base_path = str(media_path or '').strip() or '/storage/videos'
+    if not base_path.startswith('/'):
+        base_path = '/' + base_path.lstrip('/')
+    base_path = base_path.rstrip('/') or '/'
+    if base_path == '/':
+        return '/kiosk_playlist.m3u'
+    return f"{base_path}/kiosk_playlist.m3u"
+
+
+def get_kiosk_media_path(kiosk_row, port):
+    configured = get_kiosk_path_setting(kiosk_row, 'media_path')
+    return configured or get_default_media_path(port)
+
+
+def get_kiosk_text_file_path(kiosk_row, port):
+    configured = get_kiosk_path_setting(kiosk_row, 'text_file_path')
+    if configured:
+        if configured.startswith('/'):
+            return configured
+        if port == 22:
+            return f"/storage/{configured.lstrip('/')}"
+        return configured
+    return get_default_text_file_path(port)
+
+
+def get_kiosk_playlist_target_file(kiosk_row, port):
+    configured = get_kiosk_path_setting(kiosk_row, 'playlist_target_file')
+    if configured:
+        if configured.startswith('/'):
+            return configured
+        media_path = get_kiosk_media_path(kiosk_row, port)
+        media_dir = (media_path or '/').rstrip('/') or '/'
+        if media_dir == '/':
+            return '/' + configured.lstrip('/')
+        return f"{media_dir}/{configured.lstrip('/')}"
+
+    media_path = get_kiosk_media_path(kiosk_row, port)
+    return build_playlist_target_from_media_path(media_path)
+
+
+def resolve_playlist_target_file(port, target_file, kiosk_row):
+    path = normalize_optional_path(target_file)
+    if not path:
+        return get_kiosk_playlist_target_file(kiosk_row, port)
+    if path.startswith('/'):
+        return path
+
+    media_path = get_kiosk_media_path(kiosk_row, port)
+    media_dir = (media_path or '/').rstrip('/') or '/'
+    if media_dir == '/':
+        return '/' + path.lstrip('/')
+    return f"{media_dir}/{path.lstrip('/')}"
+
+
+def resolve_text_file_path(port, file_path, default_file_path=None):
+    path = str(file_path or '').strip()
+    fallback_path = str(default_file_path or '').strip()
+
+    if not path:
+        return fallback_path or get_default_text_file_path(port)
+
+    # Jeśli ścieżka jest względna, użyj katalogu z configured default, jeśli jest absolutny.
+    if not path.startswith('/'):
+        if fallback_path.startswith('/'):
+            base_dir = posixpath.dirname(fallback_path.rstrip('/')) or '/'
+            return posixpath.join(base_dir, path).replace('\\', '/')
+        if port == 22:
+            return f"/storage/{path.lstrip('/')}"
+        return path
+
+    return path
+
 # Obsługa FTP (tradycyjny vsftpd)
 def ftp_connect(hostname, username, password, port=21):
     try:
-        ftp = ftplib.FTP()
-        ftp.connect(hostname, port)
+        ftp = ftplib.FTP(timeout=10)
+        ftp.connect(hostname, port, timeout=10)
         ftp.login(username, password)
         return ftp
+    except ftplib.all_errors as e:
+        print(f"FTP connection error: {e}")
+        return None
+    except OSError as e:
+        print(f"FTP connection error: {e}")
+        return None
     except Exception as e:
         print(f"FTP connection error: {e}")
         return None
@@ -315,6 +661,7 @@ def connect_file_transfer(hostname, username, password, port=21):
     """
     Uniwersalna funkcja łącząca z serwerem plików
     Automatycznie wybiera FTP (port 21) lub SFTP (port 22)
+    Obsługuje retry z exponential backoff dla przejściowych błędów
     
     Args:
         hostname: Adres IP kiosku
@@ -332,8 +679,21 @@ def connect_file_transfer(hostname, username, password, port=21):
         # Klucze SSH są używane tylko do komend SSH, nie do SFTP
         return sftp_connect(hostname, username, password, port)
     else:
-        # Tradycyjny FTP (vsftpd)
-        return ftp_connect(hostname, username, password, port)
+        # Tradycyjny FTP (vsftpd) - spróbuj z retry
+        retry_count = 3
+        retry_delay = 1  # sekund
+        
+        for attempt in range(retry_count):
+            conn = ftp_connect(hostname, username, password, port)
+            if conn:
+                return conn
+            
+            if attempt < retry_count - 1:
+                print(f"FTP connection retry {attempt + 1}/{retry_count - 1}, waiting {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # exponential backoff
+        
+        return None
 
 # Nowa funkcja do tworzenia katalogów FTP
 def ftp_create_directory(ftp, path):
@@ -435,7 +795,8 @@ def ticker_text():
     return "Addon Kodi pobiera plik lokalnie z /storage/napis.txt", 200, {'Content-Type': 'text/plain'}
 
 @app.route('/api/settings', methods=['GET'])
-@admin_required
+@token_required
+@action_permission_required('settings.manage')
 def get_settings():
     conn = get_db_connection()
     settings = conn.execute('SELECT * FROM settings').fetchall()
@@ -447,7 +808,8 @@ def get_settings():
     return jsonify(settings_dict)
 
 @app.route('/api/settings', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('settings.manage')
 def update_settings():
     data = request.json
     
@@ -458,11 +820,25 @@ def update_settings():
     
     for key, value in data.items():
         conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+
+    if 'tickerOrientation' not in data and 'orientation' in data:
+        conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('tickerOrientation', str(data.get('orientation') or '').strip().lower()))
     
     conn.commit()
     conn.close()
     
     return jsonify({"message": "Ustawienia zaktualizowane pomyślnie"})
+
+
+@app.route('/api/ticker-orientation', methods=['GET'])
+def get_ticker_orientation():
+    conn = get_db_connection()
+    setting = conn.execute('SELECT value FROM settings WHERE key = ?', ('tickerOrientation',)).fetchone()
+    conn.close()
+    orientation = (setting['value'] if setting else 'normal') or 'normal'
+    return jsonify({
+        'orientation': normalize_orientation_value(orientation),
+    })
 
 @app.route('/api/kiosks', methods=['GET'])
 @token_required
@@ -498,8 +874,346 @@ def get_kiosks():
     
     return jsonify([dict(kiosk) for kiosk in kiosks])
 
+
+def get_or_create_playlist(conn, kiosk_id, playlist_name='Default'):
+    playlist = conn.execute(
+        'SELECT id, kiosk_id, name, order_mode, created_at, updated_at FROM playlists WHERE kiosk_id = ? AND name = ?',
+        (kiosk_id, playlist_name)
+    ).fetchone()
+
+    if playlist:
+        return playlist
+
+    conn.execute(
+        'INSERT INTO playlists (kiosk_id, name, order_mode, updated_at) VALUES (?, ?, ?, ?)',
+        (kiosk_id, playlist_name, 'manual', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    )
+    conn.commit()
+    return conn.execute(
+        'SELECT id, kiosk_id, name, order_mode, created_at, updated_at FROM playlists WHERE kiosk_id = ? AND name = ?',
+        (kiosk_id, playlist_name)
+    ).fetchone()
+
+
+def apply_playlist_order(items, order_mode):
+    if order_mode == 'name_asc':
+        return sorted(items, key=lambda x: str(x['file_name']).lower())
+    if order_mode == 'name_desc':
+        return sorted(items, key=lambda x: str(x['file_name']).lower(), reverse=True)
+    if order_mode == 'random':
+        shuffled = list(items)
+        import random
+        random.shuffle(shuffled)
+        return shuffled
+    return sorted(items, key=lambda x: (x['position'], x['id']))
+
+
+def build_playlist_m3u(items, order_mode):
+    ordered = apply_playlist_order(items, order_mode)
+    lines = ['#EXTM3U']
+    for item in ordered:
+        freq = item['display_frequency'] if item['display_frequency'] and item['display_frequency'] > 0 else 1
+        for _ in range(freq):
+            lines.append(str(item['file_path']))
+    return '\n'.join(lines) + '\n'
+
+
+def sync_orientation_hint_to_kiosk(kiosk_row, orientation_value, target_file='/storage/kiosk_orientation.txt'):
+    hostname = kiosk_row['ip_address']
+    username = kiosk_row['ftp_username'] or 'root'
+    password = kiosk_row['ftp_password'] or ''
+
+    if not hostname or not password:
+        raise Exception('Brak IP lub hasła FTP/SFTP kiosku do synchronizacji orientacji')
+
+    conn = connect_file_transfer(hostname, username, password, 22)
+    used_port = 22
+    if not conn:
+        conn = connect_file_transfer(hostname, username, password, 21)
+        used_port = 21
+    if not conn:
+        raise Exception('Nie można połączyć się z kioskiem przez SFTP ani FTP')
+
+    try:
+        content = normalize_orientation_value(orientation_value)
+        if isinstance(conn, SFTPHandler):
+            conn.put_file_content(target_file, content)
+            conn.close()
+        else:
+            remote_dir = os.path.dirname(target_file) or '/'
+            remote_name = os.path.basename(target_file)
+            conn.cwd(remote_dir)
+            with io.BytesIO((content + '\n').encode('utf-8')) as stream:
+                conn.storbinary(f'STOR {remote_name}', stream)
+            conn.quit()
+        return used_port
+    except Exception:
+        try:
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
+        except Exception:
+            pass
+        raise
+
+
+def sync_orientation_hint_via_ssh(kiosk_row, orientation_value, target_file='/storage/kiosk_orientation.txt'):
+    hostname = kiosk_row['ip_address']
+    if not hostname:
+        raise Exception('Brak IP kiosku do synchronizacji orientacji przez SSH')
+
+    conn = get_db_connection()
+    settings = conn.execute('SELECT key, value FROM settings WHERE key IN ("defaultSshUsername", "defaultSshPort")').fetchall()
+    conn.close()
+    settings_dict = {setting['key']: setting['value'] for setting in settings}
+
+    username_candidates = build_ssh_username_candidates(kiosk_row, settings_dict)
+    ssh_port = int(settings_dict.get('defaultSshPort', 22))
+    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
+    ssh_password = kiosk_row['ftp_password'] if 'ftp_password' in kiosk_row.keys() else None
+
+    content = normalize_orientation_value(orientation_value)
+
+    ssh, _ = connect_ssh_with_username_fallback(
+        hostname=hostname,
+        port=ssh_port,
+        username_candidates=username_candidates,
+        key_path=ssh_key_path,
+        password=ssh_password,
+    )
+
+    try:
+        # value and target_file are controlled in backend, so simple quoting is sufficient here.
+        cmd = f"bash -lc 'printf \"%s\\n\" \"{content}\" > \"{target_file}\"'"
+        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
+        _ = stdin
+        err = stderr.read().decode('utf-8', errors='ignore').strip()
+        code = stdout.channel.recv_exit_status()
+        if code != 0:
+            raise Exception(err or f'Nie udało się zapisać pliku orientacji przez SSH (exit code {code})')
+        return ssh_port
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+
+def normalize_orientation_value(value):
+    orientation = (value or '').strip().lower()
+    if orientation in ('0', 'normal'):
+        return 'normal'
+    if orientation in ('90', 'right'):
+        return 'right'
+    if orientation in ('270', 'left'):
+        return 'left'
+    if orientation in ('180', 'inverted'):
+        return 'inverted'
+    return 'normal'
+
+
+def sync_playlist_to_kiosk(kiosk_row, playlist_content, target_file=None):
+    hostname = kiosk_row['ip_address']
+    username = kiosk_row['ftp_username'] or 'root'
+    password = kiosk_row['ftp_password'] or ''
+    target_path = target_file or get_kiosk_playlist_target_file(kiosk_row, 22)
+
+    if not hostname or not password:
+        raise Exception('Brak IP lub hasła FTP/SFTP kiosku do synchronizacji playlisty')
+
+    # Preferuj SFTP dla LibreELEC/Kodi.
+    conn = connect_file_transfer(hostname, username, password, 22)
+    used_port = 22
+    if not conn:
+        conn = connect_file_transfer(hostname, username, password, 21)
+        used_port = 21
+    if not conn:
+        raise Exception('Nie można połączyć się z kioskiem przez SFTP ani FTP')
+
+    try:
+        if isinstance(conn, SFTPHandler):
+            conn.put_file_content(target_path, playlist_content)
+            conn.close()
+        else:
+            remote_dir = os.path.dirname(target_path) or '/'
+            remote_name = os.path.basename(target_path)
+            conn.cwd(remote_dir)
+            with io.BytesIO(playlist_content.encode('utf-8')) as stream:
+                conn.storbinary(f'STOR {remote_name}', stream)
+            conn.quit()
+        return used_port
+    except Exception:
+        try:
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
+        except Exception:
+            pass
+        raise
+
+
+@app.route('/api/kiosks/<int:kiosk_id>/playlist', methods=['GET'])
+@token_required
+def get_kiosk_playlist(kiosk_id):
+    playlist_name = (request.args.get('name') or 'Default').strip() or 'Default'
+
+    conn = get_db_connection()
+    kiosk = conn.execute(
+        'SELECT id, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+        (kiosk_id,)
+    ).fetchone()
+    if not kiosk:
+        conn.close()
+        return jsonify({'error': 'Kiosk nie znaleziony'}), 404
+
+    playlist = get_or_create_playlist(conn, kiosk_id, playlist_name)
+    items = conn.execute(
+        '''
+        SELECT id, position, file_path, file_name, file_type, file_size, display_frequency
+        FROM playlist_items
+        WHERE playlist_id = ?
+        ORDER BY position ASC, id ASC
+        ''',
+        (playlist['id'],)
+    ).fetchall()
+    conn.close()
+
+    return jsonify({
+        'playlist': {
+            'id': playlist['id'],
+            'kiosk_id': playlist['kiosk_id'],
+            'name': playlist['name'],
+            'order_mode': playlist['order_mode'] or 'manual',
+            'targetFile': get_kiosk_playlist_target_file(kiosk, 22),
+            'created_at': playlist['created_at'],
+            'updated_at': playlist['updated_at'],
+        },
+        'items': [
+            {
+                'id': item['id'],
+                'position': item['position'],
+                'path': item['file_path'],
+                'name': item['file_name'],
+                'type': item['file_type'] or 'file',
+                'size': item['file_size'] or 0,
+                'displayFrequency': item['display_frequency'] or 1,
+            }
+            for item in items
+        ],
+    })
+
+
+@app.route('/api/kiosks/<int:kiosk_id>/playlist', methods=['PUT'])
+@token_required
+@action_permission_required('playlist.save')
+def save_kiosk_playlist(kiosk_id):
+    data = request.json or {}
+    items = data.get('items', [])
+    playlist_name = (data.get('name') or 'Default').strip() or 'Default'
+    order_mode = str(data.get('orderMode') or 'manual').strip() or 'manual'
+
+    allowed_order_modes = {'manual', 'name_asc', 'name_desc', 'random'}
+    if order_mode not in allowed_order_modes:
+        return jsonify({'error': 'Nieprawidłowy orderMode. Dozwolone: manual, name_asc, name_desc, random'}), 400
+
+    if not isinstance(items, list):
+        return jsonify({'error': 'Pole items musi być listą'}), 400
+
+    conn = get_db_connection()
+    kiosk = conn.execute(
+        'SELECT id, ip_address, ftp_username, ftp_password, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+        (kiosk_id,)
+    ).fetchone()
+    if not kiosk:
+        conn.close()
+        return jsonify({'error': 'Kiosk nie znaleziony'}), 404
+
+    target_file = resolve_playlist_target_file(22, data.get('targetFile'), kiosk)
+
+    playlist = get_or_create_playlist(conn, kiosk_id, playlist_name)
+
+    try:
+        conn.execute('DELETE FROM playlist_items WHERE playlist_id = ?', (playlist['id'],))
+
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get('path') or '').strip()
+            file_name = str(item.get('name') or '').strip()
+            if not file_path or not file_name:
+                continue
+            file_type = str(item.get('type') or 'file').strip() or 'file'
+            file_size = item.get('size')
+            display_frequency = item.get('displayFrequency', 1)
+            try:
+                file_size = int(file_size) if file_size is not None else 0
+            except (TypeError, ValueError):
+                file_size = 0
+            try:
+                display_frequency = int(display_frequency)
+                if display_frequency < 1:
+                    display_frequency = 1
+            except (TypeError, ValueError):
+                display_frequency = 1
+
+            conn.execute(
+                '''
+                INSERT INTO playlist_items (playlist_id, position, file_path, file_name, file_type, file_size, display_frequency)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (playlist['id'], index + 1, file_path, file_name, file_type, file_size, display_frequency)
+            )
+
+        conn.execute(
+            'UPDATE playlists SET order_mode = ?, updated_at = ? WHERE id = ?',
+            (order_mode, datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), playlist['id'])
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'Błąd zapisu playlisty: {str(e)}'}), 500
+
+    saved_items = conn.execute(
+        '''
+        SELECT id, position, file_path, file_name, file_type, file_size, display_frequency
+        FROM playlist_items
+        WHERE playlist_id = ?
+        ORDER BY position ASC, id ASC
+        ''',
+        (playlist['id'],)
+    ).fetchall()
+    saved_count = len(saved_items)
+    conn.close()
+
+    sync_error = None
+    sync_port = None
+    try:
+        playlist_content = build_playlist_m3u(saved_items, order_mode)
+        sync_port = sync_playlist_to_kiosk(kiosk, playlist_content, target_file)
+    except Exception as e:
+        sync_error = str(e)
+
+    response = {
+        'message': 'Playlista zapisana pomyślnie',
+        'playlistId': playlist['id'],
+        'itemsCount': saved_count,
+        'orderMode': order_mode,
+        'targetFile': target_file,
+    }
+    if sync_port:
+        response['synced'] = True
+        response['syncPort'] = sync_port
+    if sync_error:
+        response['synced'] = False
+        response['syncError'] = sync_error
+
+    return jsonify(response)
+
 @app.route('/api/kiosks', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('kiosk.manage')
 def add_kiosk():
     data = request.json
     
@@ -509,9 +1223,12 @@ def add_kiosk():
     conn = get_db_connection()
     try:
         conn.execute(
-            'INSERT INTO kiosks (mac_address, serial_number, name, ftp_username, ftp_password) VALUES (?, ?, ?, ?, ?)',
+              'INSERT INTO kiosks (mac_address, serial_number, name, ftp_username, ftp_password, media_path, text_file_path, playlist_target_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (data['mac_address'], data['serial_number'], data.get('name', ''),
-             data.get('ftp_username', ''), data.get('ftp_password', ''))
+               data.get('ftp_username', ''), data.get('ftp_password', ''),
+               normalize_optional_path(data.get('media_path')),
+               normalize_optional_path(data.get('text_file_path')),
+               normalize_optional_path(data.get('playlist_target_file')))
         )
         conn.commit()
         kiosk_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -526,12 +1243,23 @@ def add_kiosk():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/kiosks/<int:kiosk_id>', methods=['PUT'])
-@admin_required
+@token_required
 def update_kiosk(kiosk_id):
     data = request.json
     
     if not data:
         return jsonify({"error": "Brak danych do aktualizacji"}), 400
+
+    current_username = getattr(g, 'current_user', None)
+    requested_fields = set(data.keys())
+    path_fields = {'media_path', 'text_file_path', 'playlist_target_file'}
+
+    if requested_fields and requested_fields.issubset(path_fields):
+        if not has_user_action_permission(current_username, 'kiosk.paths'):
+            return jsonify({"error": "Brak uprawnień do edycji ścieżek kiosku"}), 403
+    else:
+        if not has_user_action_permission(current_username, 'kiosk.manage'):
+            return jsonify({"error": "Brak uprawnień do edycji kiosku"}), 403
     
     conn = get_db_connection()
     
@@ -548,6 +1276,9 @@ def update_kiosk(kiosk_id):
         'serial_number': data.get('serial_number'),
         'ftp_username': data.get('ftp_username'),
         'ftp_password': data.get('ftp_password'),
+        'media_path': normalize_optional_path(data.get('media_path')) if 'media_path' in data else None,
+        'text_file_path': normalize_optional_path(data.get('text_file_path')) if 'text_file_path' in data else None,
+        'playlist_target_file': normalize_optional_path(data.get('playlist_target_file')) if 'playlist_target_file' in data else None,
         'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     
@@ -573,7 +1304,8 @@ def update_kiosk(kiosk_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/kiosks/<int:kiosk_id>', methods=['DELETE'])
-@admin_required
+@token_required
+@action_permission_required('kiosk.manage')
 def delete_kiosk(kiosk_id):
     conn = get_db_connection()
     
@@ -660,15 +1392,34 @@ def test_ftp_connection():
     
     protocol = get_protocol(port)
     conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
-    
+
+    # Fallback: jeśli FTP na 21 jest niedostępny, spróbuj SFTP na 22.
+    if not conn and port == 21:
+        fallback_port = 22
+        fallback_protocol = get_protocol(fallback_port)
+        print(f"FTP connect failed on {data['hostname']}:{port}, trying fallback {fallback_protocol.upper()}:{fallback_port}")
+        fallback_conn = connect_file_transfer(data['hostname'], data['username'], data['password'], fallback_port)
+        if fallback_conn:
+            if isinstance(fallback_conn, SFTPHandler):
+                fallback_conn.close()
+            else:
+                fallback_conn.quit()
+            return jsonify({
+                "message": f"Połączenie {fallback_protocol.upper()} udane (automatyczny fallback z FTP:21)",
+                "protocol": fallback_protocol,
+                "port": fallback_port,
+                "fallback": True,
+            })
+
     if conn:
         if isinstance(conn, SFTPHandler):
             conn.close()
         else:
             conn.quit()
-        return jsonify({"message": f"Połączenie {protocol.upper()} udane"})
-    else:
-        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
+        return jsonify({"message": f"Połączenie {protocol.upper()} udane", "protocol": protocol, "port": port})
+
+    error_msg = f"Nie można połączyć się z serwerem {protocol.upper()} na {data['hostname']}:{port}. Sprawdź czy serwer słucha na podanym porcie i podane dane logowania są poprawne."
+    return jsonify({"error": error_msg}), 500
 
 @app.route('/api/ftp/files', methods=['POST'])
 @token_required
@@ -678,8 +1429,24 @@ def list_ftp_files():
     if not data or 'hostname' not in data or 'username' not in data or 'password' not in data:
         return jsonify({"error": "Brakujące dane połączenia"}), 400
     
-    # Domyślna ścieżka dla LibreELEC SFTP to /storage/videos
-    # Dla Debian/vsftpd FTP to /home/kiosk/MediaPionowe
+    kiosk = None
+    kiosk_id = data.get('kioskId')
+    if kiosk_id is not None and str(kiosk_id).strip():
+        try:
+            parsed_kiosk_id = int(kiosk_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": "kioskId musi być liczbą całkowitą"}), 400
+
+        db_conn = get_db_connection()
+        kiosk = db_conn.execute(
+            'SELECT id, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+            (parsed_kiosk_id,)
+        ).fetchone()
+        db_conn.close()
+
+        if not kiosk:
+            return jsonify({"error": "Kiosk nie znaleziony"}), 404
+
     port = 21
     if 'port' in data:
         try:
@@ -687,13 +1454,27 @@ def list_ftp_files():
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    # Automatyczne określanie domyślnej ścieżki w zależności od protokołu
-    default_path = '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe'
-    remote_path = data.get('path', default_path)
+    # Automatyczne określanie domyślnej ścieżki na podstawie protokołu i ustawień kiosku.
+    requested_path = str(data.get('path', '')).strip()
+    path_provided = bool(requested_path)
+    default_path = get_kiosk_media_path(kiosk, port)
+    remote_path = requested_path if path_provided else default_path
     
     protocol = get_protocol(port)
     conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
-    
+
+    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP 22.
+    if not conn and port == 21:
+        fallback_port = 22
+        fallback_protocol = get_protocol(fallback_port)
+        fallback_conn = connect_file_transfer(data['hostname'], data['username'], data['password'], fallback_port)
+        if fallback_conn:
+            conn = fallback_conn
+            port = fallback_port
+            protocol = fallback_protocol
+            if not path_provided:
+                remote_path = get_kiosk_media_path(kiosk, fallback_port)
+
     if not conn:
         return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
@@ -797,7 +1578,7 @@ def upload_ftp_file():
         username = data.get('username')
         password = data.get('password')
         port = int(data.get('port', 21))
-        remote_path = data.get('path', '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe')
+        remote_path = data.get('path', get_default_media_path(port))
         file_name = data.get('file_name') or file.filename
         
         print(f"Upload (FormData) - file: {file_name}, size: {file.content_length}, path: {remote_path}, port: {port}")
@@ -866,7 +1647,7 @@ def upload_ftp_file():
             except (ValueError, TypeError):
                 return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
         
-        default_path = '/home/kiosk/MediaPionowe' if port == 22 else '/home/kiosk/MediaPionowe'
+        default_path = get_default_media_path(port)
         remote_path = data.get('path', default_path)
         file_name = data.get('file_name')
         file_data = data.get('file_data')
@@ -1055,7 +1836,10 @@ def get_kiosk_ftp_credentials(kiosk_id):
     conn = get_db_connection()
     
     # Sprawdzenie, czy kiosk istnieje
-    kiosk = conn.execute('SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
+    kiosk = conn.execute(
+        'SELECT id, name, ip_address, ftp_username, ftp_password, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+        (kiosk_id,)
+    ).fetchone()
     if not kiosk:
         conn.close()
         return jsonify({"error": "Kiosk nie znaleziony"}), 404
@@ -1068,7 +1852,10 @@ def get_kiosk_ftp_credentials(kiosk_id):
         "name": kiosk['name'],
         "ip_address": kiosk['ip_address'],
         "ftp_username": kiosk['ftp_username'],
-        "ftp_password": kiosk['ftp_password']
+        "ftp_password": kiosk['ftp_password'],
+        "media_path": kiosk['media_path'],
+        "text_file_path": kiosk['text_file_path'],
+        "playlist_target_file": kiosk['playlist_target_file'],
     })
 
 @app.route('/api/ftp/mkdir', methods=['POST'])
@@ -1211,10 +1998,16 @@ def download_ftp_file():
         return jsonify({"error": f"Nieoczekiwany błąd: {str(e)}"}), 500
 
 @app.route('/api/kiosks/<int:kiosk_id>/restart-service', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('kiosk.restart')
 def restart_kiosk_service(kiosk_id):
     # Pobierz dane z żądania (jeśli istnieją)
     request_data = request.json or {}
+    
+    # Wymagaj hasła SSH przy restarcie
+    ssh_password = (request_data.get('password') or '').strip()
+    if not ssh_password:
+        return jsonify({"error": "Hasło SSH jest wymagane do restartu usługi"}), 400
     
     conn = get_db_connection()
     
@@ -1237,12 +2030,7 @@ def restart_kiosk_service(kiosk_id):
     
     # Zamień ustawienia na słownik
     settings_dict = {setting['key']: setting['value'] for setting in settings}
-    
-    # Preferuj kolejno: nazwę użytkownika z żądania -> ftp_username kiosku -> domyślne ustawienie -> 'root'
-    ssh_username = request_data.get('username')
-    if not ssh_username:
-        kiosk_ftp_user = kiosk['ftp_username'] if 'ftp_username' in kiosk.keys() else None
-        ssh_username = kiosk_ftp_user or settings_dict.get('defaultSshUsername', 'root')
+    username_candidates = build_ssh_username_candidates(kiosk, settings_dict, request_data)
     
     # Określamy ścieżkę do klucza SSH - zawsze używamy stałej nazwy pliku
     ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
@@ -1256,57 +2044,22 @@ def restart_kiosk_service(kiosk_id):
     
     # Wypisz informacje diagnostyczne dla celów debugowania
     print(f"Restarting service kiosk on kiosk {kiosk['name'] or kiosk['id']} ({kiosk['ip_address']})")
-    print(f"SSH connection details: {ssh_username}@{kiosk['ip_address']}:{ssh_port} using key authentication from {ssh_key_path}")
+    print(f"SSH connection candidates: {', '.join(username_candidates)}@{kiosk['ip_address']}:{ssh_port} using key authentication from {ssh_key_path}")
     
     try:
-        import paramiko
-        
-        # Utwórz klienta SSH
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
         try:
-            # Załaduj klucz SSH
-            try:
-                private_key = paramiko.RSAKey.from_private_key_file(ssh_key_path)
-                print(f"Klucz SSH załadowany pomyślnie: {ssh_key_path}")
-            except Exception as key_error:
-                print(f"Błąd podczas ładowania klucza SSH: {key_error}")
-                return jsonify({"error": f"Błąd podczas ładowania klucza SSH: {str(key_error)}"}), 500
-
-            # Połącz z kioskiem przez SSH używając klucza
-            try:
-                ssh.connect(
-                    hostname=kiosk['ip_address'],
-                    port=ssh_port,
-                    username=ssh_username,
-                    pkey=private_key,
-                    timeout=10,
-                    look_for_keys=False,
-                    allow_agent=False
-                )
-                print(f"Połączono przez SSH używając klucza")
-            except paramiko.AuthenticationException:
-                # Jeśli autentykacja kluczem nie zadziałała, spróbuj z hasłem (jeśli podane)
-                ssh_password = request_data.get('password')
-                if ssh_password:
-                    print(f"Autentykacja kluczem nieudana, próba z hasłem...")
-                    ssh.connect(
-                        hostname=kiosk['ip_address'],
-                        port=ssh_port,
-                        username=ssh_username,
-                        password=ssh_password,
-                        timeout=10,
-                        look_for_keys=False,
-                        allow_agent=False
-                    )
-                    print(f"Połączono przez SSH używając hasła")
-                else:
-                    raise
+            ssh, used_username = connect_ssh_with_username_fallback(
+                hostname=kiosk['ip_address'],
+                port=ssh_port,
+                username_candidates=username_candidates,
+                key_path=ssh_key_path,
+                password=ssh_password
+            )
+            print(f"Połączono przez SSH używając konta {used_username}")
         except Exception as e:
             print(f"Błąd połączenia SSH: {str(e)}")
             return jsonify({
-                "error": f"Nie można połączyć się z kioskiem przez SSH: {str(e)}. Sprawdź czy klucz publiczny jest zainstalowany na kiosku w ~/.ssh/authorized_keys lub podaj hasło SSH."
+                "error": f"Nie można połączyć się z kioskiem przez SSH: {str(e)}. Sprawdź czy klucz publiczny jest zainstalowany na kiosku w ~/.ssh/authorized_keys lub ustaw właściwy login SSH."
             }), 500
         
         # Wykonaj komendę restartu usługi
@@ -1377,7 +2130,26 @@ def api_get_file_content():
     port = int(data.get('port', 21))
     username = data['username']
     password = data.get('password', '')
-    file_path = data['path']
+    kiosk = None
+    kiosk_id = data.get('kioskId')
+    if kiosk_id is not None and str(kiosk_id).strip():
+        try:
+            parsed_kiosk_id = int(kiosk_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": "kioskId musi być liczbą całkowitą"}), 400
+
+        db_conn = get_db_connection()
+        kiosk = db_conn.execute(
+            'SELECT id, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+            (parsed_kiosk_id,)
+        ).fetchone()
+        db_conn.close()
+
+        if not kiosk:
+            return jsonify({"error": "Kiosk nie znaleziony"}), 404
+
+    default_text_path = get_kiosk_text_file_path(kiosk, port)
+    file_path = resolve_text_file_path(port, data.get('path'), default_text_path)
     
     print(f"GET file content: {file_path} from {hostname}:{port} (user: {username})")
     
@@ -1388,6 +2160,20 @@ def api_get_file_content():
     # Połącz z FTP lub SFTP (w zależności od portu)
     protocol = get_protocol(port)
     conn = connect_file_transfer(hostname, username, password, port)
+
+    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP na 22 i dostosuj domyślną ścieżkę.
+    if not conn and port == 21:
+        fallback_port = 22
+        fallback_protocol = get_protocol(fallback_port)
+        fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
+        fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
+        fallback_conn = connect_file_transfer(hostname, username, password, fallback_port)
+        if fallback_conn:
+            conn = fallback_conn
+            port = fallback_port
+            protocol = fallback_protocol
+            file_path = fallback_path
+
     if not conn:
         return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
@@ -1441,7 +2227,26 @@ def api_put_file_content():
     port = int(data.get('port', 21))
     username = data['username']
     password = data.get('password', '')
-    file_path = data['path']
+    kiosk = None
+    kiosk_id = data.get('kioskId')
+    if kiosk_id is not None and str(kiosk_id).strip():
+        try:
+            parsed_kiosk_id = int(kiosk_id)
+        except (ValueError, TypeError):
+            return jsonify({"error": "kioskId musi być liczbą całkowitą"}), 400
+
+        db_conn = get_db_connection()
+        kiosk = db_conn.execute(
+            'SELECT id, media_path, text_file_path, playlist_target_file FROM kiosks WHERE id = ?',
+            (parsed_kiosk_id,)
+        ).fetchone()
+        db_conn.close()
+
+        if not kiosk:
+            return jsonify({"error": "Kiosk nie znaleziony"}), 404
+
+    default_text_path = get_kiosk_text_file_path(kiosk, port)
+    file_path = resolve_text_file_path(port, data.get('path'), default_text_path)
     content = data['content']
     
     print(f"PUT file content: {file_path} to {hostname}:{port} (user: {username}), content length: {len(content)}")
@@ -1453,6 +2258,20 @@ def api_put_file_content():
     # Połącz z FTP lub SFTP (w zależności od portu)
     protocol = get_protocol(port)
     conn = connect_file_transfer(hostname, username, password, port)
+
+    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP na 22 i dostosuj domyślną ścieżkę.
+    if not conn and port == 21:
+        fallback_port = 22
+        fallback_protocol = get_protocol(fallback_port)
+        fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
+        fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
+        fallback_conn = connect_file_transfer(hostname, username, password, fallback_port)
+        if fallback_conn:
+            conn = fallback_conn
+            port = fallback_port
+            protocol = fallback_protocol
+            file_path = fallback_path
+
     if not conn:
         return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
@@ -1500,7 +2319,8 @@ Strategia:
    (z mapowaniem '0' -> 'normal')
 """
 @app.route('/api/kiosks/<int:kiosk_id>/rotate-display', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('kiosk.rotate')
 def rotate_kiosk_display(kiosk_id):
     data = request.json or {}
     orientation = (data.get('orientation') or '').strip().lower()
@@ -1508,16 +2328,7 @@ def rotate_kiosk_display(kiosk_id):
     if orientation not in allowed:
         return jsonify({"error": "Nieprawidłowa orientacja. Dozwolone: right | 0 (normal) | left | inverted | 90 | 180 | 270"}), 400
     # Znormalizuj do wartości wspieranych przez xrandr ('normal','right','left','inverted')
-    if orientation == '0' or orientation == 'normal':
-        normalized = 'normal'
-    elif orientation == '90' or orientation == 'right':
-        normalized = 'right'
-    elif orientation == '270' or orientation == 'left':
-        normalized = 'left'
-    elif orientation == '180' or orientation == 'inverted':
-        normalized = 'inverted'
-    else:
-        normalized = orientation
+    normalized = normalize_orientation_value(orientation)
 
     conn = get_db_connection()
     kiosk = conn.execute('SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
@@ -1532,8 +2343,7 @@ def rotate_kiosk_display(kiosk_id):
     settings = conn.execute('SELECT key, value FROM settings WHERE key IN ("defaultSshUsername", "defaultSshPort")').fetchall()
     conn.close()
     settings_dict = {s['key']: s['value'] for s in settings}
-    # Preferuj ftp_username kiosku jako nazwę użytkownika SSH, w przeciwnym razie użyj ustawień lub 'root'
-    ssh_username = kiosk['ftp_username'] if kiosk['ftp_username'] else settings_dict.get('defaultSshUsername', 'root')
+    username_candidates = build_ssh_username_candidates(kiosk, settings_dict)
     ssh_port = int(settings_dict.get('defaultSshPort', 22))
 
     ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
@@ -1542,28 +2352,22 @@ def rotate_kiosk_display(kiosk_id):
     if not has_key and not ssh_password:
         return jsonify({"error": "Brak klucza SSH i hasła. Skonfiguruj backend/ssh_keys/kiosk_id_rsa_openssh lub ustaw ftp_password dla kiosku."}), 500
 
+    orientation_file_error = None
+    orientation_file_port = None
     try:
-        import paramiko
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        # Spróbuj połączyć się kluczem, a w razie niepowodzenia hasłem (jeśli jest dostępne)
-        connected = False
-        last_err = None
-        if has_key:
-            try:
-                key = paramiko.RSAKey.from_private_key_file(ssh_key_path)
-                ssh.connect(kiosk['ip_address'], port=ssh_port, username=ssh_username, pkey=key, timeout=10)
-                connected = True
-            except Exception as e_auth:
-                last_err = e_auth
-        if not connected and ssh_password:
-            try:
-                ssh.connect(kiosk['ip_address'], port=ssh_port, username=ssh_username, password=ssh_password, timeout=10)
-                connected = True
-            except Exception as e_auth2:
-                last_err = e_auth2
-        if not connected:
-            raise last_err or Exception("Nie udało się uwierzytelnić przez SSH (klucz ani hasło nie zadziałały)")
+        orientation_file_port = sync_orientation_hint_to_kiosk(kiosk, normalized)
+    except Exception as hint_error:
+        orientation_file_error = str(hint_error)
+
+    try:
+        ssh, used_username = connect_ssh_with_username_fallback(
+            hostname=kiosk['ip_address'],
+            port=ssh_port,
+            username_candidates=username_candidates,
+            key_path=ssh_key_path,
+            password=ssh_password,
+        )
+        print(f"Połączono przez SSH używając konta {used_username}")
 
         # Wykonaj xrandr na ekranie :0, ustawiając zarówno orientację ekranu (-o), jak i per-output (--rotate)
         # To zapewnia poprawny powrót do 'normal', niezależnie od wcześniejszej metody.
@@ -1588,13 +2392,121 @@ def rotate_kiosk_display(kiosk_id):
         ssh.close()
 
         if code != 0:
+            if orientation_file_port:
+                return jsonify({
+                    "success": True,
+                    "message": "Orientacja zapisana w pliku orientacji kiosku, xrandr nie powiódł się",
+                    "orientation": normalized,
+                    "fallbackApplied": True,
+                    "orientationFile": "/storage/kiosk_orientation.txt",
+                    "orientationFilePort": orientation_file_port,
+                    "orientationFileError": orientation_file_error,
+                    "stdout": out,
+                    "stderr": err,
+                    "exitCode": code,
+                })
             return jsonify({"error": f"Błąd xrandr: {err or 'nieznany błąd'}", "stdout": out, "stderr": err, "exitCode": code}), 500
 
-        return jsonify({"message": "Ekran obrócony", "stdout": out})
+        return jsonify({
+            "success": True,
+            "message": "Ekran obrócony",
+            "orientation": normalized,
+            "orientationFile": "/storage/kiosk_orientation.txt",
+            "orientationFilePort": orientation_file_port,
+            "orientationFileError": orientation_file_error,
+            "stdout": out,
+        })
     except ImportError:
+        if orientation_file_port:
+            return jsonify({
+                "success": True,
+                "message": "Orientacja zapisana w pliku orientacji kiosku, ale brak biblioteki paramiko do xrandr",
+                "orientation": normalized,
+                "fallbackApplied": True,
+                "orientationFile": "/storage/kiosk_orientation.txt",
+                "orientationFilePort": orientation_file_port,
+                "orientationFileError": orientation_file_error,
+            })
         return jsonify({"error": "Brak biblioteki paramiko. Zainstaluj: pip install paramiko"}), 500
     except Exception as e:
+        if orientation_file_port:
+            return jsonify({
+                "success": True,
+                "message": "Orientacja zapisana w pliku orientacji kiosku, wystąpił błąd przy xrandr",
+                "orientation": normalized,
+                "fallbackApplied": True,
+                "orientationFile": "/storage/kiosk_orientation.txt",
+                "orientationFilePort": orientation_file_port,
+                "orientationFileError": orientation_file_error,
+                "error": str(e),
+            })
         return jsonify({"error": f"Nieoczekiwany błąd: {str(e)}"}), 500
+
+
+@app.route('/api/kiosks/<int:kiosk_id>/orientation-file', methods=['POST'])
+@token_required
+@action_permission_required('kiosk.rotate')
+def write_kiosk_orientation_file(kiosk_id):
+    data = request.json or {}
+    orientation = (data.get('orientation') or '').strip().lower()
+    allowed = ['right', '0', 'normal', 'left', 'inverted', '90', '270', '180']
+    if orientation not in allowed:
+        return jsonify({"error": "Nieprawidłowa orientacja. Dozwolone: right | 0 (normal) | left | inverted | 90 | 180 | 270"}), 400
+
+    normalized = normalize_orientation_value(orientation)
+
+    conn = get_db_connection()
+    kiosk = conn.execute(
+        'SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?',
+        (kiosk_id,)
+    ).fetchone()
+    conn.close()
+    if not kiosk:
+        return jsonify({"error": "Kiosk nie znaleziony"}), 404
+
+    transfer_errors = []
+    used_port = None
+    used_method = None
+
+    if kiosk['ip_address']:
+        try:
+            used_port = sync_orientation_hint_to_kiosk(kiosk, normalized)
+            used_method = 'sftp' if used_port == 22 else 'ftp'
+        except Exception as transfer_error:
+            transfer_errors.append(str(transfer_error))
+
+        if not used_port:
+            try:
+                used_port = sync_orientation_hint_via_ssh(kiosk, normalized)
+                used_method = 'ssh'
+            except Exception as ssh_error:
+                transfer_errors.append(str(ssh_error))
+    else:
+        transfer_errors.append('Kiosk nie ma przypisanego adresu IP')
+
+    db_conn = get_db_connection()
+    db_conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('tickerOrientation', normalized))
+    db_conn.commit()
+    db_conn.close()
+
+    if used_port:
+        return jsonify({
+            "success": True,
+            "message": f"Orientacja zapisana ({used_method})",
+            "orientation": normalized,
+            "orientationFile": "/storage/kiosk_orientation.txt",
+            "orientationFilePort": used_port,
+            "warning": '; '.join(transfer_errors) if transfer_errors else None,
+        })
+
+    return jsonify({
+        "success": True,
+        "message": "Orientacja zapisana w ustawieniach backendu, ale nie udało się zapisać pliku na kiosk",
+        "orientation": normalized,
+        "orientationFile": "/storage/kiosk_orientation.txt",
+        "orientationFilePort": None,
+        "warning": '; '.join(transfer_errors) if transfer_errors else 'Nieznany błąd transferu',
+    })
 
 # =============================================================================
 # TRASY DO SERWOWANIA FRONTENDU
@@ -1920,14 +2832,122 @@ def cancel_reservation(reservation_id):
 
 # Zarządzanie użytkownikami
 
+@app.route('/api/permissions/catalog', methods=['GET'])
+@token_required
+@action_permission_required('users.manage')
+def get_permissions_catalog():
+    return jsonify({
+        "success": True,
+        "actions": [
+            {"key": key, "label": label}
+            for key, label in ACTION_PERMISSION_CATALOG.items()
+        ]
+    }), 200
+
+
+@app.route('/api/users/<int:user_id>/permissions', methods=['GET'])
+@token_required
+@action_permission_required('users.manage')
+def get_user_permissions(user_id):
+    conn = get_db_connection()
+    user = conn.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"error": "Użytkownik nie istnieje"}), 404
+
+    permissions_rows = conn.execute(
+        'SELECT action, allowed FROM user_action_permissions WHERE user_id = ?',
+        (user_id,)
+    ).fetchall()
+    conn.close()
+
+    permissions_map = {row['action']: bool(int(row['allowed'])) for row in permissions_rows}
+
+    # Admin ma pełne uprawnienia niezależnie od mapy.
+    if (user['role'] or 'user') == 'admin':
+        for action_key in ACTION_PERMISSION_CATALOG.keys():
+            permissions_map[action_key] = True
+
+    return jsonify({
+        "success": True,
+        "user": {
+            "id": user['id'],
+            "username": user['username'],
+            "role": user['role'] or 'user',
+        },
+        "permissions": permissions_map,
+    }), 200
+
+
+@app.route('/api/users/<int:user_id>/permissions', methods=['PUT'])
+@token_required
+@action_permission_required('users.manage')
+def update_user_permissions(user_id):
+    data = request.get_json() or {}
+    permissions = data.get('permissions')
+    if not isinstance(permissions, dict):
+        return jsonify({"error": "Pole permissions musi być obiektem key->bool"}), 400
+
+    conn = get_db_connection()
+    user = conn.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"error": "Użytkownik nie istnieje"}), 404
+
+    if (user['role'] or 'user') == 'admin':
+        conn.close()
+        return jsonify({"error": "Uprawnienia akcji dla administratora są zawsze pełne"}), 400
+
+    invalid_keys = [key for key in permissions.keys() if key not in ACTION_PERMISSION_CATALOG]
+    if invalid_keys:
+        conn.close()
+        return jsonify({"error": f"Nieznane akcje uprawnień: {', '.join(invalid_keys)}"}), 400
+
+    try:
+        conn.execute('DELETE FROM user_action_permissions WHERE user_id = ?', (user_id,))
+
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        for action_key, allowed in permissions.items():
+            if bool(allowed):
+                conn.execute(
+                    '''
+                    INSERT INTO user_action_permissions (user_id, action, allowed, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ''',
+                    (user_id, action_key, now)
+                )
+
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": f"Błąd zapisu uprawnień: {str(e)}"}), 500
+
+    updated_rows = conn.execute(
+        'SELECT action, allowed FROM user_action_permissions WHERE user_id = ?',
+        (user_id,)
+    ).fetchall()
+    conn.close()
+
+    updated_permissions = {key: False for key in ACTION_PERMISSION_CATALOG.keys()}
+    for row in updated_rows:
+        updated_permissions[row['action']] = bool(int(row['allowed']))
+
+    return jsonify({
+        "success": True,
+        "message": f"Uprawnienia akcji użytkownika '{user['username']}' zostały zaktualizowane",
+        "user_id": user_id,
+        "permissions": updated_permissions,
+    }), 200
+
 @app.route('/api/users', methods=['GET'])
-@admin_required
+@token_required
+@action_permission_required('users.manage')
 def get_users():
     """Pobierz listę wszystkich użytkowników"""
     try:
         conn = get_db_connection()
         users = conn.execute('''
-            SELECT id, username, role, created_at, updated_at
+            SELECT id, username, role, must_change_password, created_at, updated_at
             FROM users
             ORDER BY created_at DESC
         ''').fetchall()
@@ -1939,6 +2959,7 @@ def get_users():
                 'id': user['id'],
                 'username': user['username'],
                 'role': user['role'] or 'user',
+                'must_change_password': bool(user['must_change_password']) if 'must_change_password' in user.keys() else False,
                 'created_at': user['created_at'],
                 'updated_at': user['updated_at']
             })
@@ -1954,7 +2975,8 @@ def get_users():
         return jsonify({"error": f"Błąd serwera: {str(e)}"}), 500
 
 @app.route('/api/users', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('users.manage')
 def create_user():
     """Utwórz nowego użytkownika"""
     try:
@@ -1989,8 +3011,8 @@ def create_user():
             
             # Wstaw nowego użytkownika
             cursor = conn.execute('''
-                INSERT INTO users (username, password)
-                VALUES (?, ?)
+                INSERT INTO users (username, password, must_change_password)
+                VALUES (?, ?, 1)
             ''', (username, hashed_password.decode('utf-8')))
             
             user_id = cursor.lastrowid
@@ -2003,6 +3025,7 @@ def create_user():
                 "success": True,
                 "user_id": user_id,
                 "username": username,
+                "must_change_password": True,
                 "message": f"Użytkownik '{username}' został utworzony pomyślnie"
             }), 201
             
@@ -2016,7 +3039,8 @@ def create_user():
         return jsonify({"error": f"Błąd serwera: {str(e)}"}), 500
 
 @app.route('/api/users/<int:user_id>', methods=['DELETE'])
-@admin_required
+@token_required
+@action_permission_required('users.manage')
 def delete_user(user_id):
     """Usuń użytkownika"""
     try:
@@ -2053,7 +3077,8 @@ def delete_user(user_id):
         return jsonify({"error": f"Błąd serwera: {str(e)}"}), 500
 
 @app.route('/api/users/<int:user_id>/role', methods=['PUT'])
-@admin_required
+@token_required
+@action_permission_required('users.manage')
 def update_user_role(user_id):
     """Aktualizuj rolę użytkownika"""
     try:
@@ -2078,13 +3103,6 @@ def update_user_role(user_id):
         if not user:
             conn.close()
             return jsonify({"error": "Użytkownik nie istnieje"}), 404
-        
-        # Sprawdzenie uprawnień - zwykły użytkownik nie może zmieniać ról
-        current_user_data = conn.execute('SELECT role FROM users WHERE username = ?', (current_user,)).fetchone()
-        
-        if current_user_data and current_user_data['role'] != 'admin':
-            conn.close()
-            return jsonify({"error": "Tylko administrator może zmieniać role użytkowników"}), 403
         
         # Aktualizuj rolę
         conn.execute('''
@@ -2153,7 +3171,7 @@ def change_password():
         # Aktualizuj hasło w bazie
         conn = get_db_connection()
         conn.execute('''
-            UPDATE users SET password = ?, updated_at = CURRENT_TIMESTAMP
+            UPDATE users SET password = ?, must_change_password = 0, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         ''', (hashed_password.decode('utf-8'), user['id']))
         conn.commit()
@@ -2171,7 +3189,8 @@ def change_password():
         return jsonify({"error": f"Błąd serwera: {str(e)}"}), 500
 
 @app.route('/api/users/<int:user_id>/change-password', methods=['POST'])
-@admin_required
+@token_required
+@action_permission_required('users.manage')
 def admin_change_user_password(user_id):
     """Zmień hasło użytkownika jako administrator (bez wymagania starego hasła)"""
     try:

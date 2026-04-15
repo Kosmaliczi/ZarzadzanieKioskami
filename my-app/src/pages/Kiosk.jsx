@@ -17,6 +17,16 @@ export default function Kiosk() {
   const [actionInfo, setActionInfo] = useState('')
   const [editingId, setEditingId] = useState(null)
   const [editForm, setEditForm] = useState(initialForm)
+  const [sshPasswordDialog, setSshPasswordDialog] = useState(false)
+  const [sshPasswordInput, setSshPasswordInput] = useState('')
+  const [pendingRestartKiosk, setPendingRestartKiosk] = useState(null)
+  const [pathSettingsDialog, setPathSettingsDialog] = useState(false)
+  const [pathSettingsKiosk, setPathSettingsKiosk] = useState(null)
+  const [pathSettingsForm, setPathSettingsForm] = useState({
+    media_path: '',
+    text_file_path: '',
+    playlist_target_file: '',
+  })
 
   const { data: kiosks, loading, error, refetch } = useAsync(() => kioskService.getKiosks())
 
@@ -40,7 +50,13 @@ export default function Kiosk() {
     },
   })
 
-  const restartMutation = useMutation(({ id, username, port }) => kioskService.restartService(id, { username, port }), {
+  const rotateMutation = useMutation(({ id, orientation }) => kioskService.rotateDisplay(id, orientation), {
+    onSuccess: async () => {
+      await refetch()
+    },
+  })
+
+  const restartMutation = useMutation(({ id, username, port, password }) => kioskService.restartService(id, { username, port, password }), {
     onSuccess: async () => {
       await refetch()
     },
@@ -138,16 +154,54 @@ export default function Kiosk() {
       return
     }
 
+    if (!kiosk.ftp_password) {
+      setPendingRestartKiosk(kiosk)
+      setSshPasswordInput('')
+      setSshPasswordDialog(true)
+      return
+    }
+
     try {
       await restartMutation.execute({
         id: kiosk.id,
         username: kiosk.ftp_username || 'root',
         port: 22,
+        password: kiosk.ftp_password,
       })
       setActionInfo(`Wysłano restart usługi dla kiosku #${kiosk.id}`)
     } catch {
       // handled by restartMutation.error
     }
+  }
+
+  const handleConfirmSshPassword = async () => {
+    if (!sshPasswordInput.trim() || !pendingRestartKiosk) {
+      setActionInfo('Hasło SSH nie może być puste')
+      return
+    }
+
+    setSshPasswordDialog(false)
+
+    try {
+      await restartMutation.execute({
+        id: pendingRestartKiosk.id,
+        username: pendingRestartKiosk.ftp_username || 'root',
+        port: 22,
+        password: sshPasswordInput.trim(),
+      })
+      setActionInfo(`Wysłano restart usługi dla kiosku #${pendingRestartKiosk.id}`)
+    } catch {
+      // handled by restartMutation.error
+    } finally {
+      setSshPasswordInput('')
+      setPendingRestartKiosk(null)
+    }
+  }
+
+  const handleCancelSshPassword = () => {
+    setSshPasswordDialog(false)
+    setSshPasswordInput('')
+    setPendingRestartKiosk(null)
   }
 
   const handleOpenSsh = (kiosk) => {
@@ -167,6 +221,64 @@ export default function Kiosk() {
     }
 
     window.open(`http://${kiosk.ip_address}:6080`, '_blank', 'noopener,noreferrer')
+  }
+
+  const handleRotate = async (kiosk) => {
+    const currentOrientation = await kioskService.getTickerOrientation()
+    const nextOrientation = currentOrientation === 'right' ? 'normal' : 'right'
+
+    try {
+      const fileResult = await kioskService.writeOrientationFile(kiosk.id, nextOrientation)
+      if (fileResult.orientationFilePort) {
+        setActionInfo(`Zmieniono orientację na ${nextOrientation} i zapisano w ${fileResult.orientationFile} (${fileResult.orientationFilePort})`)
+      } else {
+        setActionInfo(`Nie zapisano pliku na kiosku: ${fileResult.warning || 'brak połączenia z kioskiem'}`)
+      }
+    } catch {
+      try {
+        await rotateMutation.execute({ id: kiosk.id, orientation: nextOrientation })
+        setActionInfo(`Wysłano obrót ekranu na ${nextOrientation} dla kiosku #${kiosk.id}`)
+      } catch {
+        // handled by rotateMutation.error / service error state
+      }
+    }
+  }
+
+  const handleOpenPathSettings = (kiosk) => {
+    setPathSettingsKiosk(kiosk)
+    setPathSettingsForm({
+      media_path: kiosk.media_path || '',
+      text_file_path: kiosk.text_file_path || '',
+      playlist_target_file: kiosk.playlist_target_file || '',
+    })
+    setPathSettingsDialog(true)
+  }
+
+  const handleClosePathSettings = () => {
+    setPathSettingsDialog(false)
+    setPathSettingsKiosk(null)
+    setPathSettingsForm({ media_path: '', text_file_path: '', playlist_target_file: '' })
+  }
+
+  const handleSavePathSettings = async () => {
+    if (!pathSettingsKiosk?.id) {
+      return
+    }
+
+    try {
+      await updateMutation.execute({
+        id: pathSettingsKiosk.id,
+        payload: {
+          media_path: pathSettingsForm.media_path.trim(),
+          text_file_path: pathSettingsForm.text_file_path.trim(),
+          playlist_target_file: pathSettingsForm.playlist_target_file.trim(),
+        },
+      })
+      setActionInfo(`Zapisano ustawienia ścieżek dla kiosku #${pathSettingsKiosk.id}`)
+      handleClosePathSettings()
+    } catch {
+      // handled by updateMutation.error
+    }
   }
 
   const rows = kiosks || []
@@ -196,6 +308,7 @@ export default function Kiosk() {
       {createMutation.error ? <p className="text-sm text-red-600">{createMutation.error.message}</p> : null}
       {updateMutation.error ? <p className="text-sm text-red-600">{updateMutation.error.message}</p> : null}
       {restartMutation.error ? <p className="text-sm text-red-600">{restartMutation.error.message}</p> : null}
+      {rotateMutation.error ? <p className="text-sm text-red-600">{rotateMutation.error.message}</p> : null}
       {deleteMutation.error ? <p className="text-sm text-red-600">{deleteMutation.error.message}</p> : null}
       {actionInfo ? <p className="text-sm text-blue-700">{actionInfo}</p> : null}
 
@@ -282,6 +395,12 @@ export default function Kiosk() {
                         <button className={ui.btn} onClick={() => handleOpenVnc(kiosk)}>
                           VNC
                         </button>
+                        <button className={ui.btn} onClick={() => handleRotate(kiosk)} disabled={rotateMutation.loading}>
+                          Obróć
+                        </button>
+                        <button className={ui.btn} onClick={() => handleOpenPathSettings(kiosk)}>
+                          Ścieżki
+                        </button>
                         <button className={ui.btnDanger} onClick={() => handleDelete(kiosk.id)} disabled={deleteMutation.loading}>
                           Usuń
                         </button>
@@ -299,6 +418,92 @@ export default function Kiosk() {
           </tbody>
         </table>
       </div>
+
+      {sshPasswordDialog ? (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-sm w-full p-6">
+            <h3 className="text-lg font-semibold mb-4">Hasło SSH dla kiosku</h3>
+            <p className="text-sm text-gray-600 mb-4">
+              Wprowadź hasło SSH dla kiosku <strong>{pendingRestartKiosk?.name || `#${pendingRestartKiosk?.id}`}</strong>
+            </p>
+            <input
+              type="password"
+              className={ui.input}
+              placeholder="Hasło SSH"
+              value={sshPasswordInput}
+              onChange={(event) => setSshPasswordInput(event.target.value)}
+              onKeyPress={(event) => {
+                if (event.key === 'Enter') {
+                  handleConfirmSshPassword()
+                }
+              }}
+              autoFocus
+            />
+            <div className="flex gap-3 mt-6">
+              <button className={ui.btnPrimary} onClick={handleConfirmSshPassword} disabled={!sshPasswordInput.trim()}>
+                Potwierdź
+              </button>
+              <button className={ui.btnSecondary} onClick={handleCancelSshPassword}>
+                Anuluj
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pathSettingsDialog ? (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-xl w-full p-6 space-y-4">
+            <h3 className="text-lg font-semibold">Ustawienia ścieżek kiosku</h3>
+            <p className="text-sm text-gray-600">
+              Kiosk <strong>{pathSettingsKiosk?.name || `#${pathSettingsKiosk?.id}`}</strong>
+            </p>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700">Folder multimediów</label>
+              <input
+                className={ui.input}
+                placeholder="np. /storage/videos"
+                value={pathSettingsForm.media_path}
+                onChange={(event) => setPathSettingsForm((prev) => ({ ...prev, media_path: event.target.value }))}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700">Plik tekstowy</label>
+              <input
+                className={ui.input}
+                placeholder="np. /storage/napis.txt"
+                value={pathSettingsForm.text_file_path}
+                onChange={(event) => setPathSettingsForm((prev) => ({ ...prev, text_file_path: event.target.value }))}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700">Plik docelowy playlisty</label>
+              <input
+                className={ui.input}
+                placeholder="np. /storage/videos/kiosk_playlist.m3u"
+                value={pathSettingsForm.playlist_target_file}
+                onChange={(event) => setPathSettingsForm((prev) => ({ ...prev, playlist_target_file: event.target.value }))}
+              />
+            </div>
+
+            <p className="text-xs text-gray-500">
+              Puste pole oznacza użycie domyślnej ścieżki zależnej od protokołu (FTP/SFTP).
+            </p>
+
+            <div className="flex gap-3 pt-2">
+              <button className={ui.btnPrimary} onClick={handleSavePathSettings} disabled={updateMutation.loading}>
+                {updateMutation.loading ? 'Zapisywanie...' : 'Zapisz ustawienia'}
+              </button>
+              <button className={ui.btnSecondary} onClick={handleClosePathSettings}>
+                Anuluj
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   )
 }

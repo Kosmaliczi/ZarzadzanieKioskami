@@ -76,6 +76,13 @@ export function useSettings() {
 }
 
 /**
+ * Hook to access Playlist Service
+ */
+export function usePlaylists() {
+  return useApi().playlists
+}
+
+/**
  * Hook to access HTTP Client directly (advanced usage)
  */
 export function useHttpClient() {
