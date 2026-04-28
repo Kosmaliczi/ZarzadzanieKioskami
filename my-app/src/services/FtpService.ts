@@ -151,8 +151,14 @@ export class FtpService {
       })
 
       if (!response.ok) {
-        const error = await response.json()
-        throw new Error(error.error?.message || 'Upload failed')
+        const errorData = await response.json().catch(() => ({}))
+        const errorMessage = 
+          typeof errorData.error === 'string' 
+            ? errorData.error 
+            : (typeof errorData.error === 'object' && errorData.error?.message) 
+              ? errorData.error.message 
+              : 'Upload failed'
+        throw new Error(errorMessage)
       }
 
       const data = (await response.json()) as FtpUploadResponse

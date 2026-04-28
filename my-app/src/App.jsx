@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Dashboard from './pages/Dashboard'
 import Ftp from './pages/Ftp'
 import Kiosk from './pages/Kiosk'
+import KioskErrorLogs from './pages/KioskErrorLogs'
 import Playlist from './pages/Playlist'
 import Reservation from './pages/Reservation'
 import Settings from './pages/Settings'
@@ -212,6 +213,7 @@ function App() {
   const navItems = [
     { key: 'dashboard', label: 'Dashboard' },
     { key: 'kiosk', label: 'Kioski' },
+    { key: 'kioskLogs', label: 'Logi aktywności' },
     { key: 'ftp', label: 'FTP' },
     { key: 'playlist', label: 'Playlista' },
     { key: 'reservation', label: 'Rezerwacje' },
@@ -226,6 +228,8 @@ function App() {
         return <Dashboard />
       case 'kiosk':
         return <Kiosk />
+      case 'kioskLogs':
+        return <KioskErrorLogs />
       case 'ftp':
         return <Ftp />
       case 'playlist':

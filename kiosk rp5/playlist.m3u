@@ -1,0 +1,8 @@
+#EXTM3U
+# Kiosk playlist template
+# Podmien ponizsze wpisy na realne pliki wideo.
+# Mozesz uzywac sciezek absolutnych albo wzglednych.
+
+/storage/videos/video1.mp4
+/storage/videos/video2.mp4
+/storage/videos/video3.mp4

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ui } from './uiClasses'
 import { useAsync, useMutation, useSettings } from '../hooks'
 
@@ -14,24 +14,22 @@ export default function Settings() {
     defaultSshUsername: 'root',
   })
 
-  const { data, loading, error, refetch } = useAsync(() => settingsService.getSettings())
+  const mergeSettingsIntoForm = (loadedSettings, previous) => ({
+    ...previous,
+    refreshInterval: Number(loadedSettings.refreshInterval ?? previous.refreshInterval),
+    defaultFtpPort: Number(loadedSettings.defaultFtpPort ?? previous.defaultFtpPort),
+    defaultSshPort: Number(loadedSettings.defaultSshPort ?? previous.defaultSshPort),
+    defaultFtpPath: String(loadedSettings.defaultFtpPath ?? previous.defaultFtpPath),
+    defaultFtpUsername: String(loadedSettings.defaultFtpUsername ?? previous.defaultFtpUsername),
+    defaultFtpPassword: String(loadedSettings.defaultFtpPassword ?? previous.defaultFtpPassword),
+    defaultSshUsername: String(loadedSettings.defaultSshUsername ?? previous.defaultSshUsername),
+  })
 
-  useEffect(() => {
-    if (!data) {
-      return
-    }
-
-    setForm((previous) => ({
-      ...previous,
-      refreshInterval: Number(data.refreshInterval ?? previous.refreshInterval),
-      defaultFtpPort: Number(data.defaultFtpPort ?? previous.defaultFtpPort),
-      defaultSshPort: Number(data.defaultSshPort ?? previous.defaultSshPort),
-      defaultFtpPath: String(data.defaultFtpPath ?? previous.defaultFtpPath),
-      defaultFtpUsername: String(data.defaultFtpUsername ?? previous.defaultFtpUsername),
-      defaultFtpPassword: String(data.defaultFtpPassword ?? previous.defaultFtpPassword),
-      defaultSshUsername: String(data.defaultSshUsername ?? previous.defaultSshUsername),
-    }))
-  }, [data])
+  const { loading, error, refetch } = useAsync(() => settingsService.getSettings(), {
+    onSuccess: (loadedSettings) => {
+      setForm((previous) => mergeSettingsIntoForm(loadedSettings || {}, previous))
+    },
+  })
 
   const saveMutation = useMutation(() => settingsService.updateSettings(form), {
     onSuccess: async () => {

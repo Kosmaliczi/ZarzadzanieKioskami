@@ -2,9 +2,13 @@ import os
 import posixpath
 import sqlite3
 import datetime
+import json
+import hashlib
 import uuid
 import time
 import threading
+import getpass
+import shlex
 from flask import Flask, request, jsonify, send_file, after_this_request, send_from_directory, g
 from flask_cors import CORS
 import ftplib
@@ -21,24 +25,70 @@ from db_config import get_database_path, get_database_dir
 # Ładowanie zmiennych środowiskowych
 load_dotenv()
 
+
+def parse_bool_env(var_name, default=False):
+    raw_value = os.getenv(var_name)
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def parse_int_env(var_name, default, min_value=None, max_value=None):
+    raw_value = os.getenv(var_name)
+    try:
+        parsed = int(raw_value) if raw_value is not None else int(default)
+    except (TypeError, ValueError):
+        parsed = int(default)
+
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+
+    return parsed
+
+
+def parse_cors_allowed_origins():
+    raw = os.getenv('CORS_ALLOWED_ORIGINS', '')
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
 app = Flask(__name__)
-CORS(app)
+
+DEFAULT_CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:5000',
+    'http://127.0.0.1:5000',
+]
+
+CORS_ALLOWED_ORIGINS = parse_cors_allowed_origins() or DEFAULT_CORS_ALLOWED_ORIGINS
+CORS(
+    app,
+    resources={r'/api/*': {'origins': CORS_ALLOWED_ORIGINS}},
+    supports_credentials=False,
+)
 
 ACTION_PERMISSION_CATALOG = {
     'kiosk.manage': 'Zarządzanie kioskami (dodaj/edytuj/usuń)',
     'kiosk.paths': 'Edycja ścieżek kiosku',
     'kiosk.restart': 'Restart usługi kiosku',
     'kiosk.rotate': 'Obrót ekranu / orientacji kiosku',
+    'kiosk.error_logs.view': 'Podgląd logów błędów kiosków',
     'playlist.save': 'Zapis i synchronizacja playlisty',
     'settings.manage': 'Zarządzanie ustawieniami systemu',
     'users.manage': 'Zarządzanie użytkownikami i rolami',
 }
 
 # Klucz do szyfrowania/deszyfrowania (powinien być taki sam jak w pliku config.js)
-ENCRYPTION_KEY = 'kiosk-manager-secure-key-2025'
+ENCRYPTION_KEY = os.getenv('KIOSK_ENCRYPTION_KEY', 'kiosk-manager-secure-key-2025')
 
 # Klucz do podpisywania tokenów JWT (powinien być przechowywany w zmiennych środowiskowych)
-JWT_SECRET_KEY = 'twoj-tajny-klucz-jwt-2025'  # W produkcji powinien być bardziej bezpieczny i przechowywany w zmiennych środowiskowych
+JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY') or os.getenv('KIOSK_JWT_SECRET')
+if not JWT_SECRET_KEY:
+    JWT_SECRET_KEY = 'twoj-tajny-klucz-jwt-2025'
+    app.logger.warning('Brak JWT_SECRET_KEY w środowisku - użyto klucza domyślnego (tylko development).')
 
 # Funkcja do deszyfrowania danych
 def decrypt_data(encrypted_text):
@@ -71,6 +121,128 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA busy_timeout = 30000')
     return conn
+
+
+def normalize_kiosk_log_level(level):
+    normalized = str(level or 'error').strip().lower()
+    if normalized == 'warn':
+        normalized = 'warning'
+
+    if normalized not in {'error', 'warning', 'info', 'debug'}:
+        return 'error'
+
+    return normalized
+
+
+def serialize_kiosk_log_details(details):
+    if details is None:
+        return None
+
+    if isinstance(details, str):
+        clean = details.strip()
+        return clean[:4000] if clean else None
+
+    try:
+        return json.dumps(details, ensure_ascii=False)[:4000]
+    except Exception:
+        return str(details)[:4000]
+
+
+def parse_kiosk_log_details(details):
+    if details is None:
+        return None
+
+    if not isinstance(details, str):
+        return details
+
+    clean = details.strip()
+    if not clean:
+        return None
+
+    try:
+        return json.loads(clean)
+    except (TypeError, ValueError):
+        return clean
+
+
+def extract_kiosk_log_direction(details):
+    parsed_details = parse_kiosk_log_details(details)
+    if isinstance(parsed_details, dict):
+        direction = str(parsed_details.get('direction') or '').strip().lower()
+        if direction in {'sent', 'received', 'internal'}:
+            return direction
+    return None
+
+
+def create_kiosk_error_log(conn, kiosk_id, serial_number, level, source, message, details=None, ip_address=None):
+    clean_message = str(message or '').strip()
+    if not clean_message:
+        return None
+
+    clean_source = str(source or 'device').strip()[:120] or 'device'
+    clean_serial = str(serial_number).strip()[:30] if serial_number else None
+    clean_ip_address = str(ip_address).strip()[:45] if ip_address else None
+
+    cursor = conn.execute(
+        '''
+        INSERT INTO kiosk_error_logs (kiosk_id, serial_number, level, source, message, details, ip_address)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            kiosk_id,
+            clean_serial,
+            normalize_kiosk_log_level(level),
+            clean_source,
+            clean_message[:2000],
+            serialize_kiosk_log_details(details),
+            clean_ip_address,
+        )
+    )
+    return cursor.lastrowid
+
+
+def create_kiosk_activity_log(
+    conn,
+    kiosk_id,
+    serial_number,
+    level,
+    source,
+    message,
+    details=None,
+    ip_address=None,
+    direction=None,
+):
+    payload = details if isinstance(details, dict) else {}
+    if direction:
+        payload = {**payload, 'direction': direction}
+
+    return create_kiosk_error_log(
+        conn=conn,
+        kiosk_id=kiosk_id,
+        serial_number=serial_number,
+        level=level,
+        source=source,
+        message=message,
+        details=payload if payload else details,
+        ip_address=ip_address,
+    )
+
+
+def mark_kiosk_online(conn, kiosk_id, ip_address=None):
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    if ip_address:
+        conn.execute(
+            'UPDATE kiosks SET ip_address = ?, last_connection = ?, status = ?, updated_at = ? WHERE id = ?',
+            (ip_address, now, 'online', now, kiosk_id)
+        )
+    else:
+        conn.execute(
+            'UPDATE kiosks SET last_connection = ?, status = ?, updated_at = ? WHERE id = ?',
+            (now, 'online', now, kiosk_id)
+        )
+
+    return now
 
 def init_db():
     if not os.path.exists(get_database_dir()):
@@ -181,6 +353,8 @@ def init_db():
     # Migracja: konfigurowalne ścieżki per kiosk.
     try:
         kiosk_columns = [column[1] for column in conn.execute('PRAGMA table_info(kiosks)').fetchall()]
+        if 'orientation' not in kiosk_columns:
+            conn.execute("ALTER TABLE kiosks ADD COLUMN orientation VARCHAR(20) NOT NULL DEFAULT 'normal'")
         if 'media_path' not in kiosk_columns:
             conn.execute("ALTER TABLE kiosks ADD COLUMN media_path TEXT")
         if 'text_file_path' not in kiosk_columns:
@@ -211,6 +385,30 @@ def init_db():
         conn.commit()
     except Exception as e:
         app.logger.error(f"Błąd podczas migracji uprawnień akcji użytkowników: {str(e)}")
+
+    # Migracja: logi błędów kiosków.
+    try:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS kiosk_error_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kiosk_id INTEGER NOT NULL,
+                serial_number VARCHAR(30),
+                level VARCHAR(20) NOT NULL DEFAULT 'error',
+                source VARCHAR(120) NOT NULL DEFAULT 'device',
+                message TEXT NOT NULL,
+                details TEXT,
+                ip_address VARCHAR(45),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(kiosk_id) REFERENCES kiosks(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_kiosk_error_logs_kiosk_created ON kiosk_error_logs(kiosk_id, created_at)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_kiosk_error_logs_created ON kiosk_error_logs(created_at)')
+        conn.commit()
+    except Exception as e:
+        app.logger.error(f"Błąd podczas migracji logów błędów kiosków: {str(e)}")
     finally:
         conn.close()
 
@@ -264,25 +462,132 @@ def update_kiosk_statuses():
             conn.close()
         _status_update_lock.release()
 
+
+LOGIN_ATTEMPT_LIMIT = parse_int_env('LOGIN_ATTEMPT_LIMIT', 5, min_value=1, max_value=20)
+LOGIN_ATTEMPT_WINDOW_SECONDS = parse_int_env('LOGIN_ATTEMPT_WINDOW_SECONDS', 300, min_value=30, max_value=3600)
+LOGIN_LOCKOUT_SECONDS = parse_int_env('LOGIN_LOCKOUT_SECONDS', 300, min_value=30, max_value=3600)
+_login_attempts = {}
+_login_attempts_lock = threading.Lock()
+
+
+@app.after_request
+def apply_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.headers.setdefault('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+
+    if request.path.startswith('/api/'):
+        response.headers.setdefault('Cache-Control', 'no-store')
+
+    if request.is_secure:
+        response.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+
+    return response
+
+
+def get_request_client_ip():
+    forwarded_for = request.headers.get('X-Forwarded-For', '')
+    if forwarded_for:
+        return forwarded_for.split(',')[0].strip()[:64]
+    return str(request.remote_addr or 'unknown')[:64]
+
+
+def extract_bearer_token():
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header:
+        return None, 'Token jest wymagany'
+
+    parts = auth_header.split(' ', 1)
+    if len(parts) != 2 or parts[0].lower() != 'bearer' or not parts[1].strip():
+        return None, 'Token jest nieprawidłowy'
+
+    return parts[1].strip(), None
+
+
+def build_login_attempt_key(username, client_ip):
+    return f"{str(username or '').strip().lower()}|{str(client_ip or 'unknown').strip().lower()}"
+
+
+def reset_login_rate_limit_state():
+    with _login_attempts_lock:
+        _login_attempts.clear()
+
+
+def is_login_temporarily_blocked(login_key):
+    now_ts = time.time()
+    with _login_attempts_lock:
+        entry = _login_attempts.get(login_key)
+        if not entry:
+            return False, 0
+
+        blocked_until = float(entry.get('blocked_until', 0) or 0)
+        if blocked_until <= 0:
+            return False, 0
+
+        if now_ts >= blocked_until:
+            _login_attempts.pop(login_key, None)
+            return False, 0
+
+        return True, max(1, int(blocked_until - now_ts))
+
+
+def register_login_failure(login_key):
+    now_ts = time.time()
+    with _login_attempts_lock:
+        entry = _login_attempts.get(login_key)
+
+        if not entry or now_ts - float(entry.get('first_failed_at', 0) or 0) > LOGIN_ATTEMPT_WINDOW_SECONDS:
+            entry = {
+                'count': 0,
+                'first_failed_at': now_ts,
+                'blocked_until': 0,
+            }
+
+        entry['count'] = int(entry.get('count', 0)) + 1
+
+        if entry['count'] >= LOGIN_ATTEMPT_LIMIT:
+            entry['blocked_until'] = now_ts + LOGIN_LOCKOUT_SECONDS
+
+        _login_attempts[login_key] = entry
+
+        blocked_until = float(entry.get('blocked_until', 0) or 0)
+        if blocked_until > now_ts:
+            return True, max(1, int(blocked_until - now_ts))
+
+        return False, 0
+
+
+def clear_login_failures(login_key):
+    with _login_attempts_lock:
+        _login_attempts.pop(login_key, None)
+
+
+def build_rate_limited_login_response(retry_after_seconds):
+    response = jsonify({
+        'success': False,
+        'message': 'Zbyt wiele nieudanych prób logowania. Spróbuj ponownie później.',
+    })
+    response.status_code = 429
+    response.headers['Retry-After'] = str(retry_after_seconds)
+    return response
+
 # Dekorator do weryfikacji tokenu JWT
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            try:
-                token = auth_header.split(" ")[1]
-            except IndexError:
-                return jsonify({'message': 'Token jest nieprawidłowy'}), 401
-
-        if not token:
-            return jsonify({'message': 'Token jest wymagany'}), 401
+        token, token_error = extract_bearer_token()
+        if token_error:
+            return jsonify({'message': token_error}), 401
 
         try:
             data = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+            username = data.get('username')
+            if not username:
+                return jsonify({'message': 'Token jest nieprawidłowy'}), 401
+
             conn = get_db_connection()
-            user = conn.execute('SELECT * FROM users WHERE username = ?', (data['username'],)).fetchone()
+            user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
             conn.close()
             if not user:
                 return jsonify({'message': 'Użytkownik nie istnieje'}), 401
@@ -299,40 +604,21 @@ def token_required(f):
                 }), 403
         except jwt.ExpiredSignatureError:
             return jsonify({'message': 'Token wygasł'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'message': 'Token jest nieprawidłowy'}), 401
-
-        return f(*args, **kwargs)
-    return decorated
-
-# Dekorator do weryfikacji uprawnień administratora
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = None
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            try:
-                token = auth_header.split(" ")[1]
-            except IndexError:
-                return jsonify({'message': 'Token jest nieprawidłowy'}), 401
-
-        if not token:
-            return jsonify({'message': 'Token jest wymagany'}), 401
-
         try:
             data = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
-            
-            # Sprawdzenie roli
-            role = data.get('role', 'user')
-            if role != 'admin':
-                return jsonify({'message': 'Brak uprawnień. Ta operacja wymaga roli administratora.'}), 403
-            
+            username = data.get('username')
+            if not username:
+                return jsonify({'message': 'Token jest nieprawidłowy'}), 401
+
             conn = get_db_connection()
-            user = conn.execute('SELECT * FROM users WHERE username = ?', (data['username'],)).fetchone()
+            user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
             conn.close()
             if not user:
                 return jsonify({'message': 'Użytkownik nie istnieje'}), 401
+
+            if (user['role'] or 'user') != 'admin':
+                return jsonify({'message': 'Brak uprawnień. Ta operacja wymaga roli administratora.'}), 403
+
             # Zapisz username i rolę w Flask g dla dostępu w endpointach
             g.current_user = user['username']
             g.current_user_role = user['role'] or 'user'
@@ -388,25 +674,34 @@ def action_permission_required(action):
 # Endpoint do weryfikacji danych logowania
 @app.route('/api/auth/login', methods=['POST'])
 def verify_login():
-    data = request.json
-    
+    data = request.get_json(silent=True)
+
     if not data or 'username' not in data or 'password' not in data:
         return jsonify({"error": "Brakujące dane logowania"}), 400
-    
-    username = data['username']
-    password = data['password']
-    
+
+    username = str(data.get('username', '')).strip()
+    password = str(data.get('password', ''))
+
+    if not username or not password or len(username) > 120 or len(password) > 1024:
+        return jsonify({"error": "Nieprawidłowy format danych logowania"}), 400
+
+    login_key = build_login_attempt_key(username, get_request_client_ip())
+    is_blocked, retry_after = is_login_temporarily_blocked(login_key)
+    if is_blocked:
+        return build_rate_limited_login_response(retry_after)
+
     conn = get_db_connection()
     user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
     conn.close()
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+        clear_login_failures(login_key)
         must_change_password = bool(user['must_change_password']) if 'must_change_password' in user.keys() else False
         # Generowanie tokenu JWT zawierającego rolę
         token = jwt.encode({
             'username': username,
             'role': user['role'] or 'user',
             'must_change_password': must_change_password,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+            'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
         }, JWT_SECRET_KEY, algorithm="HS256")
         return jsonify({
             "success": True,
@@ -416,6 +711,11 @@ def verify_login():
             "token": token,
             "message": "Logowanie pomyślne"
         })
+
+    lock_applied, retry_after = register_login_failure(login_key)
+    if lock_applied:
+        return build_rate_limited_login_response(retry_after)
+
     return jsonify({
         "success": False,
         "message": "Nieprawidłowa nazwa użytkownika lub hasło"
@@ -511,6 +811,14 @@ def connect_ssh_with_username_fallback(hostname, port, username_candidates, key_
         except Exception as auth_error:
             last_error = auth_error
 
+    # Jeśli hasło nie zostało dostarczone, pytaj o nie interaktywnie
+    if password is None:
+        try:
+            password = getpass.getpass(f"Klucz SSH nie zadziałał. Podaj hasło do kiosku {hostname}: ")
+        except Exception:
+            # Jeśli getpass nie działa (np. w API), pomijamy pytanie interaktywne
+            password = None
+
     if password:
         for username in username_candidates:
             try:
@@ -548,8 +856,54 @@ def get_default_media_path(port):
 
 
 def get_default_text_file_path(port):
-    # LibreELEC / Kodi lokalnie używa /storage/napis.txt
-    return '/storage/napis.txt' if port == 22 else 'napis.txt'
+    # Domyślnie /home/kiosk/napis.txt
+    return '/home/kiosk/napis.txt' if port == 22 else 'napis.txt'
+
+
+SCROLLING_TEXT_HIDE_DIRECTIVE = '__KIOSK_SCROLLING_TEXT_HIDDEN__'
+
+
+def is_scrolling_text_hidden_content(content):
+    normalized = str(content or '').strip().lower()
+    if not normalized:
+        return False
+    return normalized in {
+        SCROLLING_TEXT_HIDE_DIRECTIVE.lower(),
+        '#hide_scrolling_text',
+    }
+
+
+def get_scrolling_text_backup_key(kiosk_id):
+    return f"kiosk:{int(kiosk_id)}:scrolling_text_backup"
+
+
+def read_scrolling_text_backup(kiosk_id):
+    key = get_scrolling_text_backup_key(kiosk_id)
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+        if not row:
+            return None
+        value = str(row['value'] or '').strip()
+        return value or None
+    finally:
+        conn.close()
+
+
+def write_scrolling_text_backup(kiosk_id, text):
+    normalized = str(text or '').strip()
+    if not normalized:
+        return
+    if is_scrolling_text_hidden_content(normalized):
+        return
+
+    key = get_scrolling_text_backup_key(kiosk_id)
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, normalized))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def normalize_optional_path(value):
@@ -639,6 +993,78 @@ def resolve_text_file_path(port, file_path, default_file_path=None):
 
     return path
 
+
+def get_ftp_text_path_candidates(path):
+    """Zwraca kandydatów ścieżki dla FTP z chroot/jail.
+
+    FTP bywa zrootowany do katalogu domowego, więc ścieżka absolutna
+    /home/kiosk/napis.txt może być widoczna jako po prostu napis.txt.
+    """
+    normalized = str(path or '').strip().replace('\\', '/')
+    if not normalized:
+        return []
+
+    candidates = []
+
+    def add(candidate):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(normalized)
+
+    if normalized.startswith('/home/kiosk/'):
+        add(normalized[len('/home/kiosk/'):])
+
+    if normalized.startswith('/'):
+        add(normalized.lstrip('/'))
+
+    add(posixpath.basename(normalized))
+    return candidates
+
+
+def get_sftp_text_path_candidates(path):
+    """Zwraca kandydatów ścieżki dla SFTP.
+
+    Różne obrazy kiosku mogą oczekiwać pliku napisu pod /home/kiosk lub /storage.
+    Dodatkowo pojedyncza ścieżka może być niedostępna (uprawnienia/mount),
+    więc próbujemy kilka bezpiecznych wariantów.
+    """
+    normalized = str(path or '').strip().replace('\\', '/')
+    if not normalized:
+        normalized = '/home/kiosk/napis.txt'
+
+    candidates = []
+
+    def add(candidate):
+        candidate = str(candidate or '').strip().replace('\\', '/')
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    filename = posixpath.basename(normalized) or 'napis.txt'
+
+    # Najpierw ścieżka wyliczona z konfiguracji kiosku.
+    add(normalized)
+
+    # Następnie najczęstsze lokalizacje używane przez player.
+    add('/home/kiosk/napis.txt')
+    add('/storage/napis.txt')
+    add('/tmp/napis.txt')
+
+    # Spróbuj odpowiednika pomiędzy /home/kiosk i /storage.
+    if normalized.startswith('/home/kiosk/'):
+        tail = normalized[len('/home/kiosk/'):]
+        add('/storage/' + tail.lstrip('/'))
+    if normalized.startswith('/storage/'):
+        tail = normalized[len('/storage/'):]
+        add('/home/kiosk/' + tail.lstrip('/'))
+
+    # Ostatecznie warianty na podstawie samej nazwy pliku.
+    add('/home/kiosk/' + filename)
+    add('/storage/' + filename)
+    add('/tmp/' + filename)
+
+    return candidates
+
 # Obsługa FTP (tradycyjny vsftpd)
 def ftp_connect(hostname, username, password, port=21):
     try:
@@ -703,6 +1129,99 @@ def ftp_create_directory(ftp, path):
     except Exception as e:
         print(f"FTP mkdir error: {e}")
         return False
+
+
+def get_ftp_media_path_candidates(path):
+    """Zwraca kandydatów ścieżki katalogu dla FTP (obsługa chroot/jail)."""
+    normalized = str(path or '').strip().replace('\\', '/')
+    if not normalized:
+        return ['/']
+
+    candidates = []
+
+    def add(candidate):
+        candidate = str(candidate or '').strip().replace('\\', '/')
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(normalized)
+
+    if normalized.startswith('/home/kiosk/'):
+        add(normalized[len('/home/kiosk/'):])
+
+    if normalized.startswith('/storage/'):
+        add(normalized[len('/storage/'):])
+
+    if normalized.startswith('/'):
+        add(normalized.lstrip('/'))
+
+    add('/')
+    return candidates
+
+
+def ftp_ensure_directory(ftp, path):
+    """Tworzy (rekurencyjnie) katalog na FTP jeśli nie istnieje."""
+    normalized = str(path or '').strip().replace('\\', '/')
+    if not normalized or normalized == '/':
+        return True
+
+    parts = [part for part in normalized.split('/') if part]
+    if not parts:
+        return True
+
+    current = '/' if normalized.startswith('/') else ''
+
+    for part in parts:
+        current = f"{current.rstrip('/')}/{part}" if current else part
+
+        try:
+            ftp.cwd(current)
+            continue
+        except Exception:
+            pass
+
+        try:
+            ftp.mkd(current)
+        except Exception as mkdir_error:
+            mkdir_message = str(mkdir_error).lower()
+            if 'exist' not in mkdir_message and 'file exists' not in mkdir_message:
+                print(f"FTP mkdir nested error for {current}: {mkdir_error}")
+                return False
+
+        try:
+            ftp.cwd(current)
+        except Exception as cwd_error:
+            print(f"FTP cwd after mkdir error for {current}: {cwd_error}")
+            return False
+
+    return True
+
+
+def ftp_change_directory_safely(ftp, remote_path):
+    """Przechodzi do katalogu FTP z fallbackami ścieżki i opcjonalnym tworzeniem."""
+    candidates = get_ftp_media_path_candidates(remote_path)
+
+    for candidate in candidates:
+        try:
+            ftp.cwd(candidate)
+            print(f"FTP cwd success using candidate: {candidate}")
+            return candidate
+        except Exception:
+            continue
+
+    for candidate in candidates:
+        if candidate in ('', '/'):
+            continue
+
+        if ftp_ensure_directory(ftp, candidate):
+            try:
+                ftp.cwd(candidate)
+                print(f"FTP cwd success after mkdir using candidate: {candidate}")
+                return candidate
+            except Exception:
+                continue
+
+    raise Exception(f"Nie można przejść do katalogu FTP: {remote_path}")
 
 # Nowa funkcja do usuwania plików/katalogów FTP
 def ftp_delete_file(ftp, path, is_directory=False):
@@ -916,88 +1435,6 @@ def build_playlist_m3u(items, order_mode):
         for _ in range(freq):
             lines.append(str(item['file_path']))
     return '\n'.join(lines) + '\n'
-
-
-def sync_orientation_hint_to_kiosk(kiosk_row, orientation_value, target_file='/storage/kiosk_orientation.txt'):
-    hostname = kiosk_row['ip_address']
-    username = kiosk_row['ftp_username'] or 'root'
-    password = kiosk_row['ftp_password'] or ''
-
-    if not hostname or not password:
-        raise Exception('Brak IP lub hasła FTP/SFTP kiosku do synchronizacji orientacji')
-
-    conn = connect_file_transfer(hostname, username, password, 22)
-    used_port = 22
-    if not conn:
-        conn = connect_file_transfer(hostname, username, password, 21)
-        used_port = 21
-    if not conn:
-        raise Exception('Nie można połączyć się z kioskiem przez SFTP ani FTP')
-
-    try:
-        content = normalize_orientation_value(orientation_value)
-        if isinstance(conn, SFTPHandler):
-            conn.put_file_content(target_file, content)
-            conn.close()
-        else:
-            remote_dir = os.path.dirname(target_file) or '/'
-            remote_name = os.path.basename(target_file)
-            conn.cwd(remote_dir)
-            with io.BytesIO((content + '\n').encode('utf-8')) as stream:
-                conn.storbinary(f'STOR {remote_name}', stream)
-            conn.quit()
-        return used_port
-    except Exception:
-        try:
-            if isinstance(conn, SFTPHandler):
-                conn.close()
-            else:
-                conn.quit()
-        except Exception:
-            pass
-        raise
-
-
-def sync_orientation_hint_via_ssh(kiosk_row, orientation_value, target_file='/storage/kiosk_orientation.txt'):
-    hostname = kiosk_row['ip_address']
-    if not hostname:
-        raise Exception('Brak IP kiosku do synchronizacji orientacji przez SSH')
-
-    conn = get_db_connection()
-    settings = conn.execute('SELECT key, value FROM settings WHERE key IN ("defaultSshUsername", "defaultSshPort")').fetchall()
-    conn.close()
-    settings_dict = {setting['key']: setting['value'] for setting in settings}
-
-    username_candidates = build_ssh_username_candidates(kiosk_row, settings_dict)
-    ssh_port = int(settings_dict.get('defaultSshPort', 22))
-    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
-    ssh_password = kiosk_row['ftp_password'] if 'ftp_password' in kiosk_row.keys() else None
-
-    content = normalize_orientation_value(orientation_value)
-
-    ssh, _ = connect_ssh_with_username_fallback(
-        hostname=hostname,
-        port=ssh_port,
-        username_candidates=username_candidates,
-        key_path=ssh_key_path,
-        password=ssh_password,
-    )
-
-    try:
-        # value and target_file are controlled in backend, so simple quoting is sufficient here.
-        cmd = f"bash -lc 'printf \"%s\\n\" \"{content}\" > \"{target_file}\"'"
-        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
-        _ = stdin
-        err = stderr.read().decode('utf-8', errors='ignore').strip()
-        code = stdout.channel.recv_exit_status()
-        if code != 0:
-            raise Exception(err or f'Nie udało się zapisać pliku orientacji przez SSH (exit code {code})')
-        return ssh_port
-    finally:
-        try:
-            ssh.close()
-        except Exception:
-            pass
 
 
 def normalize_orientation_value(value):
@@ -1342,11 +1779,9 @@ def update_device_ip(serial_number):
     conn = get_db_connection()
 
     kiosk = conn.execute(
-        'SELECT * FROM kiosks WHERE serial_number = ?', 
+        'SELECT * FROM kiosks WHERE UPPER(TRIM(serial_number)) = UPPER(TRIM(?))',
         (serial_number,)
     ).fetchone()
-
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if not kiosk:
         # Zamykamy połączenie z bazą danych
@@ -1357,22 +1792,319 @@ def update_device_ip(serial_number):
             "message": "Kiosk o podanym numerze seryjnym nie jest zarejestrowany w systemie"
         }), 404
 
-    update_query = 'UPDATE kiosks SET ip_address = ?, last_connection = ?, status = ?, updated_at = ?'
-    update_params = [ip_address, now, 'online', now]
-
+    now = mark_kiosk_online(conn, kiosk['id'], ip_address)
     if mac_address:
-        update_query += ', mac_address = ?'
-        update_params.append(mac_address)
+        conn.execute(
+            'UPDATE kiosks SET mac_address = ?, updated_at = ? WHERE id = ?',
+            (mac_address, now, kiosk['id'])
+        )
 
-    update_query += ' WHERE serial_number = ?'
-    update_params.append(serial_number)
-
-    conn.execute(update_query, update_params)
     conn.commit()
     conn.close()
 
     # Zwróć prostą odpowiedź JSON bez żadnych nagłówków sterujących
     return jsonify({"status": "ok", "action": "updated"})
+
+
+@app.route('/api/device/<string:serial_number>/error-log', methods=['POST'])
+def create_device_error_log(serial_number):
+    data = request.get_json(silent=True) or {}
+    message = str(data.get('message') or '').strip()
+
+    if not message:
+        return jsonify({"error": "Pole message jest wymagane"}), 400
+
+    conn = get_db_connection()
+    try:
+        kiosk = conn.execute(
+            'SELECT id, serial_number, ip_address, orientation FROM kiosks WHERE UPPER(TRIM(serial_number)) = UPPER(TRIM(?))',
+            (serial_number,)
+        ).fetchone()
+
+        if not kiosk:
+            return jsonify({
+                "status": "error",
+                "message": "Kiosk o podanym numerze seryjnym nie jest zarejestrowany w systemie"
+            }), 404
+
+        log_id = create_kiosk_error_log(
+            conn=conn,
+            kiosk_id=kiosk['id'],
+            serial_number=kiosk['serial_number'],
+            level=data.get('level'),
+            source=data.get('source') or 'device',
+            message=message,
+            details={
+                'direction': 'received',
+                'payload': data.get('details'),
+            } if data.get('details') is not None else {'direction': 'received'},
+            ip_address=data.get('ip_address') or request.remote_addr or kiosk['ip_address'],
+        )
+
+        if not log_id:
+            return jsonify({"error": "Nie udało się zapisać logu"}), 500
+
+        mark_kiosk_online(conn, kiosk['id'], data.get('ip_address') or request.remote_addr or kiosk['ip_address'])
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "log_id": log_id,
+            "message": "Log błędu zapisany"
+        }), 201
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(f"Błąd zapisu logu błędu kiosku {serial_number}: {str(e)}")
+        return jsonify({"error": "Nie udało się zapisać logu błędu kiosku"}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/device/<string:serial_number>/orientation', methods=['GET'])
+def get_device_orientation(serial_number):
+    conn = get_db_connection()
+    try:
+        kiosk = conn.execute(
+            'SELECT id, serial_number, ip_address FROM kiosks WHERE UPPER(TRIM(serial_number)) = UPPER(TRIM(?))',
+            (serial_number,)
+        ).fetchone()
+
+        if not kiosk:
+            return jsonify({
+                "success": False,
+                "message": "Kiosk o podanym numerze seryjnym nie jest zarejestrowany w systemie"
+            }), 404
+
+        kiosk_orientation = normalize_orientation_value(kiosk['orientation'] or 'normal')
+
+        if kiosk_orientation == 'normal':
+            orientation_setting = conn.execute(
+                'SELECT value FROM settings WHERE key = ?',
+                ('tickerOrientation',)
+            ).fetchone()
+            orientation = normalize_orientation_value((orientation_setting['value'] if orientation_setting else 'normal') or 'normal')
+        else:
+            orientation = kiosk_orientation
+
+        now = mark_kiosk_online(conn, kiosk['id'], request.remote_addr or kiosk['ip_address'])
+        create_kiosk_activity_log(
+            conn=conn,
+            kiosk_id=kiosk['id'],
+            serial_number=kiosk['serial_number'],
+            level='debug',
+            source='device.orientation',
+            message='Kiosk pobrał orientację z backendu',
+            details={
+                'direction': 'received',
+                'orientation': orientation,
+            },
+            ip_address=request.remote_addr or kiosk['ip_address'],
+            direction='received',
+        )
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "serial_number": kiosk['serial_number'],
+            "orientation": orientation,
+            "updated_at": now,
+        })
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(f"Błąd pobierania orientacji kiosku {serial_number}: {str(e)}")
+        return jsonify({"error": "Nie udało się pobrać orientacji kiosku"}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/device/<string:serial_number>/playlist', methods=['GET'])
+def get_device_playlist(serial_number):
+    playlist_name = (request.args.get('name') or 'Default').strip() or 'Default'
+
+    conn = get_db_connection()
+    try:
+        kiosk = conn.execute(
+            '''
+            SELECT id, name, serial_number, ip_address, media_path, text_file_path, playlist_target_file
+            FROM kiosks
+            WHERE UPPER(TRIM(serial_number)) = UPPER(TRIM(?))
+            ''',
+            (serial_number,)
+        ).fetchone()
+
+        if not kiosk:
+            return jsonify({
+                "success": False,
+                "message": "Kiosk o podanym numerze seryjnym nie jest zarejestrowany w systemie"
+            }), 404
+
+        playlist = get_or_create_playlist(conn, kiosk['id'], playlist_name)
+        create_kiosk_activity_log(
+            conn=conn,
+            kiosk_id=kiosk['id'],
+            serial_number=kiosk['serial_number'],
+            level='debug',
+            source='device.playlist',
+            message='Kiosk pobrał playlistę z backendu',
+            details={
+                'direction': 'received',
+                'playlist_name': playlist_name,
+                'playlist_id': playlist['id'],
+            },
+            ip_address=request.remote_addr or kiosk['ip_address'],
+            direction='received',
+        )
+        items = conn.execute(
+            '''
+            SELECT id, position, file_path, file_name, file_type, file_size, display_frequency
+            FROM playlist_items
+            WHERE playlist_id = ?
+            ORDER BY position ASC, id ASC
+            ''',
+            (playlist['id'],)
+        ).fetchall()
+
+        orientation_setting = conn.execute(
+            'SELECT value FROM settings WHERE key = ?',
+            ('tickerOrientation',)
+        ).fetchone()
+        orientation = normalize_orientation_value((orientation_setting['value'] if orientation_setting else 'normal') or 'normal')
+
+        order_mode = playlist['order_mode'] or 'manual'
+        playlist_content = build_playlist_m3u(items, order_mode)
+        playlist_hash = hashlib.sha256(playlist_content.encode('utf-8')).hexdigest()
+
+        now = mark_kiosk_online(conn, kiosk['id'], request.remote_addr or kiosk['ip_address'])
+        conn.commit()
+
+        requested_etag = (request.headers.get('If-None-Match') or '').strip().strip('"')
+        if requested_etag and requested_etag == playlist_hash:
+            not_modified = app.response_class(status=304)
+            not_modified.set_etag(playlist_hash)
+            not_modified.headers['Cache-Control'] = 'no-store'
+            return not_modified
+
+        response = jsonify({
+            "success": True,
+            "serial_number": kiosk['serial_number'],
+            "kiosk_id": kiosk['id'],
+            "orientation": orientation,
+            "updated_at": now,
+            "playlist": {
+                "id": playlist['id'],
+                "name": playlist['name'],
+                "order_mode": order_mode,
+                "targetFile": get_kiosk_playlist_target_file(kiosk, 22),
+                "items_count": len(items),
+                "updated_at": playlist['updated_at'],
+                "hash": playlist_hash,
+                "content": playlist_content,
+            },
+            "items": [
+                {
+                    "id": item['id'],
+                    "position": item['position'],
+                    "path": item['file_path'],
+                    "name": item['file_name'],
+                    "type": item['file_type'] or 'file',
+                    "size": item['file_size'] or 0,
+                    "displayFrequency": item['display_frequency'] or 1,
+                }
+                for item in items
+            ],
+        })
+        response.set_etag(playlist_hash)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        conn.rollback()
+        app.logger.error(f"Błąd pobierania playlisty kiosku {serial_number}: {str(e)}")
+        return jsonify({"error": "Nie udało się pobrać playlisty kiosku"}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/kiosks/error-logs', methods=['GET'])
+@token_required
+@action_permission_required('kiosk.error_logs.view')
+def get_kiosk_error_logs():
+    limit_raw = request.args.get('limit', '200')
+    kiosk_id_raw = request.args.get('kiosk_id')
+    level_raw = request.args.get('level')
+
+    try:
+        limit = int(limit_raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Parametr limit musi być liczbą całkowitą"}), 400
+
+    limit = max(1, min(limit, 500))
+
+    where_clauses = []
+    params = []
+
+    if kiosk_id_raw not in (None, ''):
+        try:
+            kiosk_id = int(kiosk_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Parametr kiosk_id musi być liczbą całkowitą"}), 400
+
+        where_clauses.append('l.kiosk_id = ?')
+        params.append(kiosk_id)
+
+    if level_raw:
+        where_clauses.append('l.level = ?')
+        params.append(normalize_kiosk_log_level(level_raw))
+
+    query = '''
+        SELECT
+            l.id,
+            l.kiosk_id,
+            COALESCE(l.serial_number, k.serial_number) AS serial_number,
+            k.name AS kiosk_name,
+            l.level,
+            l.source,
+            l.message,
+            l.details,
+            COALESCE(l.ip_address, k.ip_address) AS ip_address,
+            l.created_at
+        FROM kiosk_error_logs l
+        LEFT JOIN kiosks k ON k.id = l.kiosk_id
+    '''
+
+    if where_clauses:
+        query += ' WHERE ' + ' AND '.join(where_clauses)
+
+    query += ' ORDER BY l.created_at DESC, l.id DESC LIMIT ?'
+    params.append(limit)
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    finally:
+        conn.close()
+
+    logs = [
+        {
+            'id': row['id'],
+            'kiosk_id': row['kiosk_id'],
+            'serial_number': row['serial_number'],
+            'kiosk_name': row['kiosk_name'],
+            'level': row['level'],
+            'source': row['source'],
+            'message': row['message'],
+            'details': parse_kiosk_log_details(row['details']),
+            'direction': extract_kiosk_log_direction(row['details']),
+            'ip_address': row['ip_address'],
+            'created_at': row['created_at'],
+        }
+        for row in rows
+    ]
+
+    return jsonify({
+        'success': True,
+        'count': len(logs),
+        'logs': logs,
+    }), 200
 
 @app.route('/api/ftp/connect', methods=['POST'])
 @token_required
@@ -1383,7 +2115,7 @@ def test_ftp_connection():
         return jsonify({"error": "Brakujące dane połączenia"}), 400
     
     # Konwersja portu na int
-    port = 21
+    port = 22
     if 'port' in data:
         try:
             port = int(data['port'])
@@ -1393,11 +2125,11 @@ def test_ftp_connection():
     protocol = get_protocol(port)
     conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
 
-    # Fallback: jeśli FTP na 21 jest niedostępny, spróbuj SFTP na 22.
-    if not conn and port == 21:
-        fallback_port = 22
+    # Fallback: jeśli SFTP na 22 jest niedostępny, spróbuj FTP na 21.
+    if not conn and port == 22:
+        fallback_port = 21
         fallback_protocol = get_protocol(fallback_port)
-        print(f"FTP connect failed on {data['hostname']}:{port}, trying fallback {fallback_protocol.upper()}:{fallback_port}")
+        print(f"SFTP connect failed on {data['hostname']}:{port}, trying fallback {fallback_protocol.upper()}:{fallback_port}")
         fallback_conn = connect_file_transfer(data['hostname'], data['username'], data['password'], fallback_port)
         if fallback_conn:
             if isinstance(fallback_conn, SFTPHandler):
@@ -1405,7 +2137,7 @@ def test_ftp_connection():
             else:
                 fallback_conn.quit()
             return jsonify({
-                "message": f"Połączenie {fallback_protocol.upper()} udane (automatyczny fallback z FTP:21)",
+                "message": f"Połączenie {fallback_protocol.upper()} udane (automatyczny fallback z SFTP:22)",
                 "protocol": fallback_protocol,
                 "port": fallback_port,
                 "fallback": True,
@@ -1447,7 +2179,7 @@ def list_ftp_files():
         if not kiosk:
             return jsonify({"error": "Kiosk nie znaleziony"}), 404
 
-    port = 21
+    port = 22
     if 'port' in data:
         try:
             port = int(data['port'])
@@ -1463,9 +2195,9 @@ def list_ftp_files():
     protocol = get_protocol(port)
     conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
 
-    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP 22.
-    if not conn and port == 21:
-        fallback_port = 22
+    # Fallback: jeśli SFTP na 22 nie działa, spróbuj FTP 21.
+    if not conn and port == 22:
+        fallback_port = 21
         fallback_protocol = get_protocol(fallback_port)
         fallback_conn = connect_file_transfer(data['hostname'], data['username'], data['password'], fallback_port)
         if fallback_conn:
@@ -1476,7 +2208,11 @@ def list_ftp_files():
                 remote_path = get_kiosk_media_path(kiosk, fallback_port)
 
     if not conn:
-        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
+        return jsonify({
+            "error": f"Nie można połączyć się z serwerem {protocol.upper()}",
+            "details": f"Host: {data['hostname']}, Port: {port}, Username: {data['username']}",
+            "suggestion": "Sprawdź czy serwer FTP/SFTP jest uruchomiony i czy dane logowania są poprawne"
+        }), 500
     
     try:
         file_info = []
@@ -1496,12 +2232,110 @@ def list_ftp_files():
                 })
         else:
             # FTP tradycyjny
-            # Zmieniamy katalog na podany
-            conn.cwd(remote_path)
+            try:
+                conn.cwd(remote_path)
+            except Exception as cwd_error:
+                error_msg = str(cwd_error)
+                print(f"FTP cwd error: {error_msg}")
+                
+                # Diagnostyka - spróbuj dowiedzieć się jaka jest ścieżka bazowa
+                current_pwd = None
+                try:
+                    current_pwd = conn.pwd()
+                    print(f"FTP current directory: {current_pwd}")
+                except:
+                    current_pwd = "unknown"
+                
+                # Jeśli jesteśmy w root, spróbuj listować tam
+                if current_pwd == '/':
+                    print(f"FTP is in root, trying to list files there instead of {remote_path}")
+                    try:
+                        root_files = []
+                        conn.dir(lambda line: root_files.append(line))
+                        # Jeśli są pliki w root, użyj tego
+                        if root_files:
+                            print(f"FTP found {len(root_files)} files in root, using that")
+                            for line in root_files:
+                                parts = line.split(None, 8)
+                                if len(parts) < 9:
+                                    continue
+                                    
+                                permissions = parts[0]
+                                size = parts[4]
+                                date_str = f"{parts[5]} {parts[6]} {parts[7]}"
+                                name = parts[8]
+                                
+                                is_dir = permissions.startswith('d')
+                                
+                                try:
+                                    size_num = int(size)
+                                except ValueError:
+                                    size_num = 0
+                                    
+                                full_path = name  # W root, ścieżka to samo nazwa
+                                    
+                                try:
+                                    if ':' in parts[7]:
+                                        current_year = datetime.datetime.now().year
+                                        mod_date = datetime.datetime.strptime(f"{date_str} {current_year}", "%b %d %H:%M %Y")
+                                    else:
+                                        mod_date = datetime.datetime.strptime(date_str, "%b %d %Y")
+                                    modified = mod_date.strftime('%Y-%m-%d %H:%M:%S')
+                                except ValueError:
+                                    modified = "Nieznana data"
+                                    
+                                file_info.append({
+                                    "name": name,
+                                    "path": full_path,
+                                    "is_directory": is_dir,
+                                    "size": size_num,
+                                    "modified": modified
+                                })
+                            
+                            # Jeśli udało się listować root, wróć z wynikami
+                            if isinstance(conn, SFTPHandler):
+                                conn.close()
+                            else:
+                                conn.quit()
+                            
+                            return jsonify(file_info)
+                    except Exception as root_list_err:
+                        print(f"FTP cannot list root: {str(root_list_err)}")
+                
+                # Jeśli nie mogliśmy listować root lub nie był to root, daj błąd
+                try:
+                    conn.quit()
+                except:
+                    pass
+                
+                if '550' in error_msg or 'failed to change directory' in error_msg.lower():
+                    return jsonify({
+                        "error": f"Katalog nie istnieje lub brak dostępu: {remote_path}",
+                        "details": error_msg,
+                        "current_pwd": current_pwd,
+                        "tried_path": remote_path,
+                        "suggestion": "Spróbuj ścieżki: / (root), /home, lub poproś administratora aby sprawdził uprawnienia FTP"
+                    }), 404
+                else:
+                    return jsonify({
+                        "error": f"Błąd zmiany katalogu: {error_msg}",
+                        "tried_path": remote_path
+                    }), 500
             
             # Pobieramy listę plików i katalogów
             files = []
-            conn.dir(lambda line: files.append(line))
+            try:
+                conn.dir(lambda line: files.append(line))
+            except Exception as dir_error:
+                print(f"FTP dir error: {str(dir_error)}")
+                try:
+                    conn.quit()
+                except:
+                    pass
+                return jsonify({
+                    "error": f"Błąd pobierania listy plików: {str(dir_error)}",
+                    "tried_path": remote_path
+                }), 500
             
             for line in files:
                 # Parsujemy dane z formatu DIR - typowy format Unix
@@ -1524,7 +2358,7 @@ def list_ftp_files():
                     size_num = 0
                     
                 # Tworzenie ścieżki
-                full_path = os.path.join(remote_path, name)
+                full_path = os.path.join(remote_path, name).replace('\\', '/')
                     
                 # Formatowanie daty modyfikacji
                 try:
@@ -1553,6 +2387,7 @@ def list_ftp_files():
         
         return jsonify(file_info)
     except Exception as e:
+        print(f"Unexpected error in list_ftp_files: {str(e)}")
         try:
             if isinstance(conn, SFTPHandler):
                 conn.close()
@@ -1560,7 +2395,10 @@ def list_ftp_files():
                 conn.quit()
         except:
             pass
-        return jsonify({"error": f"Błąd podczas listowania plików: {str(e)}"}), 500
+        return jsonify({
+            "error": f"Błąd podczas listowania plików: {str(e)}",
+            "tried_path": remote_path
+        }), 500
 
 @app.route('/api/ftp/upload', methods=['POST'])
 @token_required
@@ -1569,65 +2407,128 @@ def upload_ftp_file():
     if request.content_type and 'multipart/form-data' in request.content_type:
         # FormData - dla dużych plików
         data = request.form
-        file = request.files.get('file')
-        
-        if not file:
-            return jsonify({"error": "Brak pliku do przesłania"}), 400
-        
         hostname = data.get('hostname')
         username = data.get('username')
         password = data.get('password')
-        port = int(data.get('port', 21))
+
+        if not hostname or not username or password is None:
+            return jsonify({"error": "Brakujące dane połączenia"}), 400
+
+        try:
+            port = int(data.get('port', 22))
+        except (ValueError, TypeError):
+            return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
+
         remote_path = data.get('path', get_default_media_path(port))
-        file_name = data.get('file_name') or file.filename
-        
-        print(f"Upload (FormData) - file: {file_name}, size: {file.content_length}, path: {remote_path}, port: {port}")
+
+        files = request.files.getlist('files')
+        if not files:
+            files = request.files.getlist('file')
+        files = [incoming for incoming in files if incoming and incoming.filename]
+
+        if not files:
+            return jsonify({"error": "Brak plików do przesłania"}), 400
+
+        print(f"Upload (FormData) - count: {len(files)}, path: {remote_path}, port: {port}")
         
         # Połączenie z serwerem (FTP lub SFTP)
         protocol = get_protocol(port)
+        print(f"Protocol: {protocol}, attempting connection to {hostname}:{port}")
         conn = connect_file_transfer(hostname, username, password, port)
         
         if not conn:
-            return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
+            error_msg = f"Nie można połączyć się z serwerem {protocol.upper()}"
+            print(f"Connection failed: {error_msg}")
+            return jsonify({"error": error_msg}), 500
+        
+        print(f"Connection successful, type: {type(conn).__name__}")
         
         try:
-            # Zapisz plik tymczasowo
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                file.save(temp_file.name)
-                temp_file_path = temp_file.name
-            
-            if isinstance(conn, SFTPHandler):
-                # SFTP - LibreELEC
-                full_path = os.path.join(remote_path, file_name).replace('\\', '/')
-                conn.upload_file(temp_file_path, full_path)
-                conn.close()
+            successful = []
+            failed = []
+
+            if not isinstance(conn, SFTPHandler):
+                print(f"FTP: changing directory, requested path: {remote_path}")
+                active_ftp_path = ftp_change_directory_safely(conn, remote_path)
+                print(f"FTP: active directory set to {active_ftp_path}")
             else:
-                # FTP tradycyjny
-                conn.cwd(remote_path)
-                with open(temp_file_path, 'rb') as f:
-                    conn.storbinary(f'STOR {file_name}', f)
-                conn.quit()
-            
-            # Usuń plik tymczasowy
-            os.remove(temp_file_path)
-            
-            return jsonify({"message": f"Plik {file_name} został pomyślnie przesłany"})
+                print(f"SFTP: using path {remote_path}")
+
+            custom_name = (data.get('file_name') or '').strip()
+
+            for index, incoming in enumerate(files):
+                file_name = custom_name if custom_name and len(files) == 1 else incoming.filename
+                temp_file_path = None
+                try:
+                    print(f"Processing file {index + 1}/{len(files)}: {file_name}")
+                    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                        incoming.save(temp_file.name)
+                        temp_file_path = temp_file.name
+                    
+                    print(f"Temp file saved: {temp_file_path}, size: {os.path.getsize(temp_file_path)}")
+
+                    if isinstance(conn, SFTPHandler):
+                        full_path = os.path.join(remote_path, file_name).replace('\\', '/')
+                        print(f"SFTP uploading to: {full_path}")
+                        
+                        # Ensure parent directory exists for SFTP (recursive mkdir)
+                        try:
+                            dir_path = os.path.dirname(full_path).replace('\\', '/')
+                            if dir_path and dir_path != '/':
+                                current_dir = ''
+                                for part in [segment for segment in dir_path.split('/') if segment]:
+                                    current_dir = f"{current_dir}/{part}" if current_dir else f"/{part}"
+                                    try:
+                                        conn.sftp.stat(current_dir)
+                                    except Exception:
+                                        conn.sftp.mkdir(current_dir)
+                                        print(f"SFTP directory created: {current_dir}")
+                        except Exception as dir_check_error:
+                            print(f"SFTP directory ensure error: {dir_check_error}")
+                        
+                        conn.upload_file(temp_file_path, full_path)
+                        print(f"SFTP upload success: {file_name}")
+                    else:
+                        print(f"FTP uploading: {file_name}")
+                        with open(temp_file_path, 'rb') as stream:
+                            conn.storbinary(f'STOR {file_name}', stream)
+                        print(f"FTP upload success: {file_name}")
+
+                    successful.append(file_name)
+                except Exception as file_error:
+                    error_str = str(file_error)
+                    print(f"Upload error for {file_name}: {error_str}")
+                    failed.append({"filename": file_name or f"file_{index + 1}", "error": error_str})
+                finally:
+                    if temp_file_path and os.path.exists(temp_file_path):
+                        try:
+                            os.remove(temp_file_path)
+                            print(f"Temp file deleted: {temp_file_path}")
+                        except Exception as cleanup_error:
+                            print(f"Failed to delete temp file: {cleanup_error}")
+
+            status_code = 200 if not failed else 207
+            print(f"Upload complete: {len(successful)} successful, {len(failed)} failed")
+            return jsonify({
+                "successful": successful,
+                "failed": failed,
+            }), status_code
         except Exception as e:
+            error_str = str(e)
+            print(f"Upload exception: {error_str}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": f"Błąd podczas przesyłania pliku: {error_str}"}), 500
+        finally:
             try:
                 if isinstance(conn, SFTPHandler):
                     conn.close()
+                    print("SFTP connection closed")
                 else:
                     conn.quit()
-            except:
-                pass
-            
-            try:
-                if 'temp_file_path' in locals():
-                    os.remove(temp_file_path)
-            except:
-                pass
-            
-            return jsonify({"error": f"Błąd podczas przesyłania pliku: {str(e)}"}), 500
+                    print("FTP connection closed")
+            except Exception as close_error:
+                print(f"Error closing connection: {close_error}")
     else:
         # JSON - dla małych plików (backward compatibility)
         data = request.json
@@ -1696,7 +2597,7 @@ def upload_ftp_file():
             # Usunięcie tymczasowego pliku
             os.remove(temp_file_path)
             
-            return jsonify({"message": f"Plik {file_name} został pomyślnie przesłany"})
+            return jsonify({"successful": [file_name], "failed": []})
         except Exception as e:
             try:
                 if isinstance(conn, SFTPHandler):
@@ -1727,7 +2628,7 @@ def delete_ftp_file():
     is_directory = data.get('is_directory', False) or data.get('isDirectory', False)
     
     # Konwersja portu na int
-    port = 21
+    port = 22
     if 'port' in data:
         try:
             port = int(data['port'])
@@ -1779,36 +2680,43 @@ def delete_multiple_ftp_files():
         return jsonify({"error": "Lista plików do usunięcia jest pusta lub nieprawidłowa"}), 400
     
     # Konwersja portu na int
-    port = 21
+    port = 22
     if 'port' in data:
         try:
             port = int(data['port'])
         except (ValueError, TypeError):
             return jsonify({"error": "Port musi być liczbą całkowitą"}), 400
     
-    # Połączenie z serwerem FTP
-    ftp = ftp_connect(data['hostname'], data['username'], data['password'], port)
+    # Połączenie z serwerem (FTP lub SFTP)
+    protocol = get_protocol(port)
+    conn = connect_file_transfer(data['hostname'], data['username'], data['password'], port)
     
-    if not ftp:
-        return jsonify({"error": "Nie można połączyć się z serwerem FTP"}), 500
+    if not conn:
+        return jsonify({"error": f"Nie można połączyć się z serwerem {protocol.upper()}"}), 500
     
     try:
         results = []
         for file_info in files:
             path = file_info.get('path')
-            is_directory = file_info.get('isDirectory', False)
+            is_directory = file_info.get('is_directory', False) or file_info.get('isDirectory', False)
             
             if not path:
                 results.append({"path": "Nieznana ścieżka", "success": False, "error": "Brak ścieżki"})
                 continue
                 
             try:
-                result = ftp_delete_file(ftp, path, is_directory)
+                if isinstance(conn, SFTPHandler):
+                    result = conn.delete_file(path, is_directory)
+                else:
+                    result = ftp_delete_file(conn, path, is_directory)
                 results.append({"path": path, "success": result, "is_directory": is_directory})
             except Exception as e:
                 results.append({"path": path, "success": False, "error": str(e), "is_directory": is_directory})
         
-        ftp.quit()
+        if isinstance(conn, SFTPHandler):
+            conn.close()
+        else:
+            conn.quit()
         
         # Sprawdź, czy były jakieś błędy
         had_errors = any(not r['success'] for r in results)
@@ -1825,7 +2733,10 @@ def delete_multiple_ftp_files():
             })
     except Exception as e:
         try:
-            ftp.quit()
+            if isinstance(conn, SFTPHandler):
+                conn.close()
+            else:
+                conn.quit()
         except:
             pass
         return jsonify({"error": f"Błąd podczas usuwania plików: {str(e)}"}), 500
@@ -1921,7 +2832,7 @@ def create_ftp_directory():
 def download_ftp_file():
     # Pobierz parametry z zapytania GET
     hostname = request.args.get('hostname')
-    port = request.args.get('port', '21')
+    port = request.args.get('port', '22')
     username = request.args.get('username')
     password = request.args.get('password')
     path = request.args.get('path')
@@ -2038,9 +2949,46 @@ def restart_kiosk_service(kiosk_id):
     # Sprawdzenie czy klucz SSH istnieje
     if not os.path.exists(ssh_key_path):
         print(f"Nie znaleziono klucza SSH ({ssh_key_path})")
+        # Log failed restart attempt
+        try:
+            log_conn = get_db_connection()
+            create_kiosk_activity_log(
+                conn=log_conn,
+                kiosk_id=kiosk_id,
+                serial_number=kiosk.get('serial_number'),
+                level='error',
+                source='backend.restart-service',
+                message='Próba restartu usługi nie powiodła się: brakuje klucza SSH',
+                details={'direction': 'sent', 'reason': 'missing_ssh_key'},
+                ip_address=kiosk['ip_address'],
+                direction='sent',
+            )
+            log_conn.commit()
+            log_conn.close()
+        except:
+            pass
         return jsonify({"error": f"Nie znaleziono klucza SSH. Upewnij się, że klucz istnieje w folderze backend/ssh_keys/kiosk_id_rsa"}), 500
     
     ssh_port = int(request_data.get('port') or settings_dict.get('defaultSshPort', 22))
+    
+    # Log restart attempt
+    try:
+        log_conn = get_db_connection()
+        create_kiosk_activity_log(
+            conn=log_conn,
+            kiosk_id=kiosk_id,
+            serial_number=kiosk.get('serial_number'),
+            level='info',
+            source='backend.restart-service',
+            message='Zainicjowano restart usługi na kiosku',
+            details={'direction': 'sent', 'service': 'kiosk.service', 'username': used_username if 'used_username' in locals() else 'unknown'},
+            ip_address=kiosk['ip_address'],
+            direction='sent',
+        )
+        log_conn.commit()
+        log_conn.close()
+    except:
+        pass
     
     # Wypisz informacje diagnostyczne dla celów debugowania
     print(f"Restarting service kiosk on kiosk {kiosk['name'] or kiosk['id']} ({kiosk['ip_address']})")
@@ -2058,6 +3006,24 @@ def restart_kiosk_service(kiosk_id):
             print(f"Połączono przez SSH używając konta {used_username}")
         except Exception as e:
             print(f"Błąd połączenia SSH: {str(e)}")
+            # Log SSH connection failure
+            try:
+                log_conn = get_db_connection()
+                create_kiosk_activity_log(
+                    conn=log_conn,
+                    kiosk_id=kiosk_id,
+                    serial_number=kiosk.get('serial_number'),
+                    level='error',
+                    source='backend.restart-service',
+                    message='Nie udało się nawiązać połączenia SSH do restartu usługi',
+                    details={'direction': 'sent', 'error': str(e)},
+                    ip_address=kiosk['ip_address'],
+                    direction='sent',
+                )
+                log_conn.commit()
+                log_conn.close()
+            except:
+                pass
             return jsonify({
                 "error": f"Nie można połączyć się z kioskiem przez SSH: {str(e)}. Sprawdź czy klucz publiczny jest zainstalowany na kiosku w ~/.ssh/authorized_keys lub ustaw właściwy login SSH."
             }), 500
@@ -2067,29 +3033,81 @@ def restart_kiosk_service(kiosk_id):
             # Zawsze restartuj kiosk.service niezależnie od systemu
             service_name = 'kiosk.service'
             print(f"Restarting service: {service_name}")
-            restart_cmd = f"sudo systemctl restart {service_name}"
+            restart_cmd = f"sudo -S -p '' systemctl restart {service_name}"
             print(f"Executing command: {restart_cmd}")
-            stdin, stdout, stderr = ssh.exec_command(restart_cmd, timeout=10)
+            stdin, stdout, stderr = ssh.exec_command(restart_cmd, timeout=10, get_pty=True)
+
+            if ssh_password:
+                stdin.write(f"{ssh_password}\n")
+                stdin.flush()
+
             exit_code = stdout.channel.recv_exit_status()
             
             if exit_code != 0:
-                # Jeśli sudo nie zadziałało, spróbuj użyć systemctl bez sudo
-                restart_cmd = f"systemctl restart {service_name}"
-                print(f"First command failed, trying: {restart_cmd}")
-                stdin, stdout, stderr = ssh.exec_command(restart_cmd, timeout=10)
-                exit_code = stdout.channel.recv_exit_status()
-                
-                if exit_code != 0:
-                    # Logowanie błędów
-                    err_output = stderr.read().decode('utf-8').strip()
+                err_output = stderr.read().decode('utf-8').strip()
+                stdout_output = stdout.read().decode('utf-8').strip()
+                combined_output = "\n".join([part for part in [err_output, stdout_output] if part])
+
+                # Log command execution failure
+                try:
+                    log_conn = get_db_connection()
+                    create_kiosk_activity_log(
+                        conn=log_conn,
+                        kiosk_id=kiosk_id,
+                        serial_number=kiosk.get('serial_number'),
+                        level='error',
+                        source='backend.restart-service',
+                        message='Nie udało się wykonać komendy restartu usługi',
+                        details={'direction': 'sent', 'exit_code': exit_code, 'error_output': combined_output[:500]},
+                        ip_address=kiosk['ip_address'],
+                        direction='sent',
+                    )
+                    log_conn.commit()
+                    log_conn.close()
+                except:
+                    pass
+
+                if any(keyword in combined_output.lower() for keyword in [
+                    'interactive authentication required',
+                    'a password is required',
+                    'sorry, try again',
+                    'incorrect password'
+                ]):
                     return jsonify({
-                        "error": f"Błąd podczas restartu usługi {service_name}: {err_output}",
+                        "error": f"Nie udało się zrestartować {service_name}: podane hasło SSH/SUDO jest nieprawidłowe albo konto nie ma uprawnień do użycia sudo.",
+                        "details": combined_output,
+                        "suggestion": "Sprawdź hasło SSH i uprawnienia sudo na kiosku. Jeśli konto ma mieć restart bez pytania o hasło, dodaj regułę NOPASSWD dla systemctl w sudoers.",
                         "command": restart_cmd,
                         "exit_code": exit_code
-                    }), 500
+                    }), 403
+
+                return jsonify({
+                    "error": f"Błąd podczas restartu usługi {service_name}: {combined_output or 'nieznany błąd'}",
+                    "command": restart_cmd,
+                    "exit_code": exit_code
+                }), 500
             
             success_message = f"Usługa {service_name} została pomyślnie zrestartowana na kiosku {kiosk['name'] or kiosk['id']}"
             print(success_message)
+            
+            # Log successful restart
+            try:
+                log_conn = get_db_connection()
+                create_kiosk_activity_log(
+                    conn=log_conn,
+                    kiosk_id=kiosk_id,
+                    serial_number=kiosk.get('serial_number'),
+                    level='info',
+                    source='backend.restart-service',
+                    message='Usługa została pomyślnie zrestartowana',
+                    details={'direction': 'sent', 'service': service_name, 'result': 'success', 'username': used_username},
+                    ip_address=kiosk['ip_address'],
+                    direction='sent',
+                )
+                log_conn.commit()
+                log_conn.close()
+            except:
+                pass
         except Exception as e:
             return jsonify({"error": f"Błąd wykonania komendy: {str(e)}"}), 500
         finally:
@@ -2107,6 +3125,8 @@ def restart_kiosk_service(kiosk_id):
         conn.close()
         
         return jsonify({
+            "success": True,
+            "kioskId": kiosk_id,
             "message": success_message
         })
     except ImportError:
@@ -2127,7 +3147,7 @@ def api_get_file_content():
         return jsonify({"error": f"Brakujące dane: {', '.join(missing)}"}), 400
     
     hostname = data['hostname']
-    port = int(data.get('port', 21))
+    port = int(data.get('port', 22))
     username = data['username']
     password = data.get('password', '')
     kiosk = None
@@ -2161,9 +3181,9 @@ def api_get_file_content():
     protocol = get_protocol(port)
     conn = connect_file_transfer(hostname, username, password, port)
 
-    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP na 22 i dostosuj domyślną ścieżkę.
-    if not conn and port == 21:
-        fallback_port = 22
+    # Fallback: jeśli SFTP na 22 nie działa, spróbuj FTP na 21 i dostosuj domyślną ścieżkę.
+    if not conn and port == 22:
+        fallback_port = 21
         fallback_protocol = get_protocol(fallback_port)
         fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
         fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
@@ -2185,11 +3205,51 @@ def api_get_file_content():
             conn.close()
         else:
             # FTP tradycyjny
-            content = ftp_get_file_content(conn, file_path)
+            content = None
+            used_path = None
+            attempted_paths = []
+            path_candidates = get_ftp_text_path_candidates(file_path)
+            for candidate in path_candidates:
+                attempted_paths.append(f"ftp:{candidate}")
+                content = ftp_get_file_content(conn, candidate)
+                if content is not None:
+                    used_path = candidate
+                    break
+
+            if used_path:
+                file_path = used_path
             conn.quit()
+
+            # Dodatkowy fallback: jeśli FTP nie potrafi odczytać pliku, spróbuj SFTP na 22.
+            if content is None:
+                fallback_port = 22
+                fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
+                fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
+                sftp_conn = connect_file_transfer(hostname, username, password, fallback_port)
+                if isinstance(sftp_conn, SFTPHandler):
+                    try:
+                        sftp_candidates = [fallback_path]
+                        base_name = posixpath.basename(fallback_path)
+                        if base_name and base_name != fallback_path:
+                            sftp_candidates.append(base_name)
+
+                        for candidate in sftp_candidates:
+                            attempted_paths.append(f"sftp:{candidate}")
+                            try:
+                                content = sftp_conn.get_file_content(candidate)
+                                if content is not None:
+                                    file_path = candidate
+                                    break
+                            except Exception:
+                                continue
+                    finally:
+                        sftp_conn.close()
             
         if content is None:
-            return jsonify({"error": f"Nie można pobrać zawartości pliku {file_path}"}), 500
+            return jsonify({
+                "error": f"Nie można pobrać zawartości pliku {file_path}",
+                "tried_paths": attempted_paths if not isinstance(conn, SFTPHandler) else [file_path],
+            }), 500
 
         return jsonify({
             "content": content,
@@ -2224,7 +3284,7 @@ def api_put_file_content():
         return jsonify({"error": f"Brakujące dane: {', '.join(missing)}"}), 400
     
     hostname = data['hostname']
-    port = int(data.get('port', 21))
+    port = int(data.get('port', 22))
     username = data['username']
     password = data.get('password', '')
     kiosk = None
@@ -2259,9 +3319,9 @@ def api_put_file_content():
     protocol = get_protocol(port)
     conn = connect_file_transfer(hostname, username, password, port)
 
-    # Fallback: jeśli FTP na 21 nie działa, spróbuj SFTP na 22 i dostosuj domyślną ścieżkę.
-    if not conn and port == 21:
-        fallback_port = 22
+    # Fallback: jeśli SFTP na 22 nie działa, spróbuj FTP na 21 i dostosuj domyślną ścieżkę.
+    if not conn and port == 22:
+        fallback_port = 21
         fallback_protocol = get_protocol(fallback_port)
         fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
         fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
@@ -2283,11 +3343,75 @@ def api_put_file_content():
             conn.close()
         else:
             # FTP tradycyjny
-            success = ftp_put_file_content(conn, file_path, content)
+            success = False
+            used_path = None
+            attempted_paths = []
+            path_candidates = get_ftp_text_path_candidates(file_path)
+            for candidate in path_candidates:
+                attempted_paths.append(f"ftp:{candidate}")
+                if ftp_put_file_content(conn, candidate, content):
+                    success = True
+                    used_path = candidate
+                    break
+
+            if used_path:
+                file_path = used_path
             conn.quit()
+
+            # Dodatkowy fallback: jeśli FTP nie potrafi zapisać pliku, spróbuj SFTP na 22.
+            if not success:
+                fallback_port = 22
+                fallback_default_text_path = get_kiosk_text_file_path(kiosk, fallback_port)
+                fallback_path = resolve_text_file_path(fallback_port, data.get('path'), fallback_default_text_path)
+                sftp_conn = connect_file_transfer(hostname, username, password, fallback_port)
+                if isinstance(sftp_conn, SFTPHandler):
+                    try:
+                        sftp_candidates = [fallback_path]
+                        base_name = posixpath.basename(fallback_path)
+                        if base_name and base_name != fallback_path:
+                            sftp_candidates.append(base_name)
+
+                        for candidate in sftp_candidates:
+                            attempted_paths.append(f"sftp:{candidate}")
+                            try:
+                                if sftp_conn.put_file_content(candidate, content):
+                                    success = True
+                                    file_path = candidate
+                                    break
+                            except Exception:
+                                continue
+                    finally:
+                        sftp_conn.close()
             
         if not success:
-            return jsonify({"error": f"Nie można zapisać zawartości pliku {file_path}"}), 500
+            return jsonify({
+                "error": f"Nie można zapisać zawartości pliku {file_path}",
+                "tried_paths": attempted_paths if not isinstance(conn, SFTPHandler) else [file_path],
+            }), 500
+
+        try:
+            log_conn = get_db_connection()
+            create_kiosk_activity_log(
+                conn=log_conn,
+                kiosk_id=kiosk['id'] if kiosk else None,
+                serial_number=kiosk['serial_number'] if kiosk else None,
+                level='info',
+                source=f'ftp.put-file-content.{get_protocol(port)}',
+                message='Zapisano zawartość pliku na kiosku',
+                details={
+                    'direction': 'sent',
+                    'path': file_path,
+                    'protocol': get_protocol(port),
+                },
+                ip_address=hostname,
+                direction='sent',
+            )
+            log_conn.commit()
+        finally:
+            try:
+                log_conn.close()
+            except Exception:
+                pass
         
         return jsonify({
             "path": file_path,
@@ -2304,6 +3428,78 @@ def api_put_file_content():
                 conn.quit()
         except:
             pass
+
+@app.route('/api/kiosks/<int:kiosk_id>/log-ssh-access', methods=['POST'])
+@token_required
+def log_ssh_access(kiosk_id):
+    """Log SSH connection attempt or activity"""
+    conn = get_db_connection()
+    kiosk = conn.execute('SELECT id, name, ip_address, serial_number FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
+    if not kiosk:
+        conn.close()
+        return jsonify({"error": "Kiosk nie znaleziony"}), 404
+    
+    request_data = request.json or {}
+    
+    try:
+        create_kiosk_activity_log(
+            conn=conn,
+            kiosk_id=kiosk_id,
+            serial_number=kiosk['serial_number'],
+            level='info',
+            source='frontend.ssh-access',
+            message='Zainicjowano połączenie SSH z kioskiem',
+            details={
+                'direction': 'sent',
+                'access_type': 'ssh',
+                'client': request_data.get('client', 'unknown'),
+            },
+            ip_address=kiosk['ip_address'],
+            direction='sent',
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Błąd logowania SSH: {str(e)}")
+    finally:
+        conn.close()
+    
+    return jsonify({"success": True}), 200
+
+@app.route('/api/kiosks/<int:kiosk_id>/log-vnc-access', methods=['POST'])
+@token_required
+def log_vnc_access(kiosk_id):
+    """Log VNC connection attempt or activity"""
+    conn = get_db_connection()
+    kiosk = conn.execute('SELECT id, name, ip_address, serial_number FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
+    if not kiosk:
+        conn.close()
+        return jsonify({"error": "Kiosk nie znaleziony"}), 404
+    
+    request_data = request.json or {}
+    
+    try:
+        create_kiosk_activity_log(
+            conn=conn,
+            kiosk_id=kiosk_id,
+            serial_number=kiosk['serial_number'],
+            level='info',
+            source='frontend.vnc-access',
+            message='Zainicjowano połączenie VNC z kioskiem',
+            details={
+                'direction': 'sent',
+                'access_type': 'vnc',
+                'client': request_data.get('client', 'unknown'),
+            },
+            ip_address=kiosk['ip_address'],
+            direction='sent',
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Błąd logowania VNC: {str(e)}")
+    finally:
+        conn.close()
+    
+    return jsonify({"success": True}), 200
 
 """ Obracanie ekranu kiosku przez SSH za pomocą xrandr.
 
@@ -2327,185 +3523,270 @@ def rotate_kiosk_display(kiosk_id):
     allowed = ['right', '0', 'normal', 'left', 'inverted', '90', '270', '180']
     if orientation not in allowed:
         return jsonify({"error": "Nieprawidłowa orientacja. Dozwolone: right | 0 (normal) | left | inverted | 90 | 180 | 270"}), 400
-    # Znormalizuj do wartości wspieranych przez xrandr ('normal','right','left','inverted')
-    normalized = normalize_orientation_value(orientation)
-
-    conn = get_db_connection()
-    kiosk = conn.execute('SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?', (kiosk_id,)).fetchone()
-    conn.close()
-    if not kiosk:
-        return jsonify({"error": "Kiosk nie znaleziony"}), 404
-    if not kiosk['ip_address']:
-        return jsonify({"error": "Kiosk nie ma przypisanego adresu IP"}), 400
-
-    # Pobierz ustawienia SSH
-    conn = get_db_connection()
-    settings = conn.execute('SELECT key, value FROM settings WHERE key IN ("defaultSshUsername", "defaultSshPort")').fetchall()
-    conn.close()
-    settings_dict = {s['key']: s['value'] for s in settings}
-    username_candidates = build_ssh_username_candidates(kiosk, settings_dict)
-    ssh_port = int(settings_dict.get('defaultSshPort', 22))
-
-    ssh_key_path = os.path.join(os.path.dirname(__file__), 'ssh_keys', 'kiosk_id_rsa_openssh')
-    has_key = os.path.exists(ssh_key_path)
-    ssh_password = kiosk['ftp_password'] if 'ftp_password' in kiosk.keys() else None
-    if not has_key and not ssh_password:
-        return jsonify({"error": "Brak klucza SSH i hasła. Skonfiguruj backend/ssh_keys/kiosk_id_rsa_openssh lub ustaw ftp_password dla kiosku."}), 500
-
-    orientation_file_error = None
-    orientation_file_port = None
-    try:
-        orientation_file_port = sync_orientation_hint_to_kiosk(kiosk, normalized)
-    except Exception as hint_error:
-        orientation_file_error = str(hint_error)
-
-    try:
-        ssh, used_username = connect_ssh_with_username_fallback(
-            hostname=kiosk['ip_address'],
-            port=ssh_port,
-            username_candidates=username_candidates,
-            key_path=ssh_key_path,
-            password=ssh_password,
-        )
-        print(f"Połączono przez SSH używając konta {used_username}")
-
-        # Wykonaj xrandr na ekranie :0, ustawiając zarówno orientację ekranu (-o), jak i per-output (--rotate)
-        # To zapewnia poprawny powrót do 'normal', niezależnie od wcześniejszej metody.
-        cmd = (
-            "bash -lc '"
-            "export DISPLAY=:0; "
-            f"ORI=\"{normalized}\"; "
-            # Najpierw spróbuj ustawić orientację ekranu (może się nie powieść na niektórych konfiguracjach)
-            "if ! xrandr -o \"$ORI\" >/dev/null 2>&1; then XO_ERR=1; else XO_ERR=0; fi; "
-            # Następnie ustaw orientację na pierwszym podłączonym wyjściu (per-output)
-            "OUT=$(xrandr | awk \"/ connected/{print $1; exit}\"); "
-            "if [ -n \"$OUT\" ]; then "
-            "  if ! xrandr --output \"$OUT\" --rotate \"$ORI\" >/dev/null 2>&1; then PO_ERR=1; else PO_ERR=0; fi; "
-            "else PO_ERR=1; fi; "
-            # Jeśli obie metody zawiodły, zwróć błąd
-            "if [ $XO_ERR -ne 0 ] && [ $PO_ERR -ne 0 ]; then echo \"rotation failed (screen and per-output)\" 1>&2; exit 1; fi'"
-        )
-        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=10)
-        out = stdout.read().decode('utf-8', errors='ignore').strip()
-        err = stderr.read().decode('utf-8', errors='ignore').strip()
-        code = stdout.channel.recv_exit_status()
-        ssh.close()
-
-        if code != 0:
-            if orientation_file_port:
-                return jsonify({
-                    "success": True,
-                    "message": "Orientacja zapisana w pliku orientacji kiosku, xrandr nie powiódł się",
-                    "orientation": normalized,
-                    "fallbackApplied": True,
-                    "orientationFile": "/storage/kiosk_orientation.txt",
-                    "orientationFilePort": orientation_file_port,
-                    "orientationFileError": orientation_file_error,
-                    "stdout": out,
-                    "stderr": err,
-                    "exitCode": code,
-                })
-            return jsonify({"error": f"Błąd xrandr: {err or 'nieznany błąd'}", "stdout": out, "stderr": err, "exitCode": code}), 500
-
-        return jsonify({
-            "success": True,
-            "message": "Ekran obrócony",
-            "orientation": normalized,
-            "orientationFile": "/storage/kiosk_orientation.txt",
-            "orientationFilePort": orientation_file_port,
-            "orientationFileError": orientation_file_error,
-            "stdout": out,
-        })
-    except ImportError:
-        if orientation_file_port:
-            return jsonify({
-                "success": True,
-                "message": "Orientacja zapisana w pliku orientacji kiosku, ale brak biblioteki paramiko do xrandr",
-                "orientation": normalized,
-                "fallbackApplied": True,
-                "orientationFile": "/storage/kiosk_orientation.txt",
-                "orientationFilePort": orientation_file_port,
-                "orientationFileError": orientation_file_error,
-            })
-        return jsonify({"error": "Brak biblioteki paramiko. Zainstaluj: pip install paramiko"}), 500
-    except Exception as e:
-        if orientation_file_port:
-            return jsonify({
-                "success": True,
-                "message": "Orientacja zapisana w pliku orientacji kiosku, wystąpił błąd przy xrandr",
-                "orientation": normalized,
-                "fallbackApplied": True,
-                "orientationFile": "/storage/kiosk_orientation.txt",
-                "orientationFilePort": orientation_file_port,
-                "orientationFileError": orientation_file_error,
-                "error": str(e),
-            })
-        return jsonify({"error": f"Nieoczekiwany błąd: {str(e)}"}), 500
-
-
-@app.route('/api/kiosks/<int:kiosk_id>/orientation-file', methods=['POST'])
-@token_required
-@action_permission_required('kiosk.rotate')
-def write_kiosk_orientation_file(kiosk_id):
-    data = request.json or {}
-    orientation = (data.get('orientation') or '').strip().lower()
-    allowed = ['right', '0', 'normal', 'left', 'inverted', '90', '270', '180']
-    if orientation not in allowed:
-        return jsonify({"error": "Nieprawidłowa orientacja. Dozwolone: right | 0 (normal) | left | inverted | 90 | 180 | 270"}), 400
-
+    
     normalized = normalize_orientation_value(orientation)
 
     conn = get_db_connection()
     kiosk = conn.execute(
-        'SELECT id, name, ip_address, ftp_username, ftp_password FROM kiosks WHERE id = ?',
+        'SELECT id, name, serial_number, ip_address, ftp_username, ftp_password, orientation FROM kiosks WHERE id = ?',
         (kiosk_id,)
     ).fetchone()
-    conn.close()
     if not kiosk:
+        conn.close()
         return jsonify({"error": "Kiosk nie znaleziony"}), 404
 
-    transfer_errors = []
-    used_port = None
-    used_method = None
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('tickerOrientation', normalized))
+    conn.execute(
+        'UPDATE kiosks SET orientation = ?, updated_at = ? WHERE id = ?',
+        (normalized, now, kiosk_id)
+    )
+    conn.commit()
+    conn.close()
 
-    if kiosk['ip_address']:
-        try:
-            used_port = sync_orientation_hint_to_kiosk(kiosk, normalized)
-            used_method = 'sftp' if used_port == 22 else 'ftp'
-        except Exception as transfer_error:
-            transfer_errors.append(str(transfer_error))
+    orientation_sync_result = {
+        "synced": False,
+        "path": None,
+    }
 
-        if not used_port:
+    hostname = (kiosk['ip_address'] or '').strip()
+    username = (kiosk['ftp_username'] or 'root').strip() or 'root'
+    password = kiosk['ftp_password'] or ''
+
+    if hostname and password:
+        transfer = connect_file_transfer(hostname, username, password, 22)
+        if isinstance(transfer, SFTPHandler):
             try:
-                used_port = sync_orientation_hint_via_ssh(kiosk, normalized)
-                used_method = 'ssh'
-            except Exception as ssh_error:
-                transfer_errors.append(str(ssh_error))
-    else:
-        transfer_errors.append('Kiosk nie ma przypisanego adresu IP')
+                candidate_paths = [
+                    '/home/kiosk/kiosk_orientation.txt',
+                    '/storage/kiosk_orientation.txt',
+                    '/tmp/kiosk_orientation.txt',
+                ]
 
-    db_conn = get_db_connection()
-    db_conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('tickerOrientation', normalized))
-    db_conn.commit()
-    db_conn.close()
+                for candidate_path in candidate_paths:
+                    try:
+                        if transfer.put_file_content(candidate_path, normalized + '\n'):
+                            orientation_sync_result['synced'] = True
+                            orientation_sync_result['path'] = candidate_path
+                            break
+                    except Exception as sync_error:
+                        print(f"Orientation sync failed for {candidate_path}: {sync_error}")
+            finally:
+                transfer.close()
 
-    if used_port:
-        return jsonify({
-            "success": True,
-            "message": f"Orientacja zapisana ({used_method})",
-            "orientation": normalized,
-            "orientationFile": "/storage/kiosk_orientation.txt",
-            "orientationFilePort": used_port,
-            "warning": '; '.join(transfer_errors) if transfer_errors else None,
-        })
+    try:
+        log_conn = get_db_connection()
+        try:
+            create_kiosk_activity_log(
+                conn=log_conn,
+                kiosk_id=kiosk_id,
+                serial_number=kiosk['serial_number'],
+                level='info' if orientation_sync_result['synced'] else 'warning',
+                source='backend.rotate-display',
+                message='Wysłano obrót ekranu do kiosku',
+                details={
+                    'direction': 'sent',
+                    'orientation': normalized,
+                    'file_synced': orientation_sync_result['synced'],
+                    'file_path': orientation_sync_result['path'],
+                },
+                ip_address=hostname,
+                direction='sent',
+            )
+            log_conn.commit()
+        finally:
+            log_conn.close()
+    except Exception as log_error:
+        print(f"Rotation activity log failed: {log_error}")
 
     return jsonify({
         "success": True,
-        "message": "Orientacja zapisana w ustawieniach backendu, ale nie udało się zapisać pliku na kiosk",
+        "message": f"Orientacja ustawiona na {normalized}. Kiosk (#{kiosk_id}) odczyta zmianę z backendowego API przy następnym synchronizowaniu.",
         "orientation": normalized,
-        "orientationFile": "/storage/kiosk_orientation.txt",
-        "orientationFilePort": None,
-        "warning": '; '.join(transfer_errors) if transfer_errors else 'Nieznany błąd transferu',
+        "orientationFileSynced": orientation_sync_result['synced'],
+        "orientationFilePath": orientation_sync_result['path'],
+    })
+
+
+@app.route('/api/kiosks/<int:kiosk_id>/scrolling-text-visibility', methods=['POST', 'PUT', 'PATCH'])
+@token_required
+@action_permission_required('kiosk.manage')
+def set_kiosk_scrolling_text_visibility(kiosk_id):
+    data = request.json or {}
+    hidden_raw = data.get('hidden', True)
+    if isinstance(hidden_raw, str):
+        hidden = hidden_raw.strip().lower() in ('1', 'true', 'yes', 'on')
+    else:
+        hidden = bool(hidden_raw)
+
+    conn = get_db_connection()
+    kiosk = conn.execute(
+        '''
+        SELECT id, name, serial_number, ip_address, ftp_username, ftp_password, text_file_path
+        FROM kiosks
+        WHERE id = ?
+        ''',
+        (kiosk_id,)
+    ).fetchone()
+    conn.close()
+
+    if not kiosk:
+        return jsonify({"error": "Kiosk nie znaleziony"}), 404
+
+    hostname = (kiosk['ip_address'] or '').strip()
+    username = (kiosk['ftp_username'] or 'root').strip() or 'root'
+    password = kiosk['ftp_password'] or ''
+
+    if not hostname or not password:
+        return jsonify({"error": "Brak IP kiosku lub hasła FTP/SFTP"}), 400
+
+    def read_remote_scrolling_text():
+        sftp_base_path = resolve_text_file_path(22, kiosk['text_file_path'], get_kiosk_text_file_path(kiosk, 22))
+        transfer_conn = connect_file_transfer(hostname, username, password, 22)
+        if isinstance(transfer_conn, SFTPHandler):
+            try:
+                for candidate in get_sftp_text_path_candidates(sftp_base_path):
+                    try:
+                        return transfer_conn.get_file_content(candidate), candidate
+                    except Exception as sftp_error:
+                        print(f"SFTP scrolling text read failed for {candidate}: {sftp_error}")
+            finally:
+                transfer_conn.close()
+
+        ftp_base_path = resolve_text_file_path(21, kiosk['text_file_path'], get_kiosk_text_file_path(kiosk, 21))
+        transfer_conn = connect_file_transfer(hostname, username, password, 21)
+        if transfer_conn:
+            try:
+                for candidate in get_ftp_text_path_candidates(ftp_base_path):
+                    try:
+                        text = ftp_get_file_content(transfer_conn, candidate)
+                        if text is not None:
+                            return text, candidate
+                    except UnicodeDecodeError as ftp_decode_error:
+                        print(f"FTP scrolling text read decode failed for {candidate}: {ftp_decode_error}")
+                    except Exception as ftp_error:
+                        print(f"FTP scrolling text read failed for {candidate}: {ftp_error}")
+            finally:
+                try:
+                    transfer_conn.quit()
+                except Exception:
+                    pass
+
+        return None, None
+
+    requested_text = str(data.get('text') or '').strip()
+    visible_text = requested_text
+
+    if hidden:
+        current_text, _current_path = read_remote_scrolling_text()
+        current_text = str(current_text or '').strip()
+        if current_text and not is_scrolling_text_hidden_content(current_text):
+            write_scrolling_text_backup(kiosk_id, current_text)
+        content = SCROLLING_TEXT_HIDE_DIRECTIVE + '\n'
+    else:
+        if not visible_text:
+            current_text, _current_path = read_remote_scrolling_text()
+            current_text = str(current_text or '').strip()
+            if current_text and not is_scrolling_text_hidden_content(current_text):
+                visible_text = current_text
+
+        if not visible_text:
+            visible_text = read_scrolling_text_backup(kiosk_id) or ''
+
+        visible_text = str(visible_text or '').strip()
+        if not visible_text:
+            return jsonify({"error": "Brak treści do przywrócenia. Ustaw tekst ręcznie przed pokazaniem paska."}), 400
+
+        write_scrolling_text_backup(kiosk_id, visible_text)
+        content = visible_text + '\n'
+
+    sync_result = {
+        'synced': False,
+        'protocol': None,
+        'port': None,
+        'path': None,
+    }
+
+    target_sftp_path = resolve_text_file_path(22, kiosk['text_file_path'], get_kiosk_text_file_path(kiosk, 22))
+
+    transfer = connect_file_transfer(hostname, username, password, 22)
+    if isinstance(transfer, SFTPHandler):
+        try:
+            for candidate_path in get_sftp_text_path_candidates(target_sftp_path):
+                try:
+                    if transfer.put_file_content(candidate_path, content):
+                        sync_result.update({
+                            'synced': True,
+                            'protocol': 'sftp',
+                            'port': 22,
+                            'path': candidate_path,
+                        })
+                        break
+                except Exception as sftp_error:
+                    print(f"SFTP scrolling text write failed for {candidate_path}: {sftp_error}")
+        finally:
+            transfer.close()
+
+    if not sync_result['synced']:
+        target_ftp_path = resolve_text_file_path(21, kiosk['text_file_path'], get_kiosk_text_file_path(kiosk, 21))
+        transfer = connect_file_transfer(hostname, username, password, 21)
+        if transfer:
+            try:
+                for candidate in get_ftp_text_path_candidates(target_ftp_path):
+                    if ftp_put_file_content(transfer, candidate, content):
+                        sync_result.update({
+                            'synced': True,
+                            'protocol': 'ftp',
+                            'port': 21,
+                            'path': candidate,
+                        })
+                        break
+            finally:
+                try:
+                    transfer.quit()
+                except Exception:
+                    pass
+
+    if not sync_result['synced']:
+        return jsonify({"error": "Nie udało się zsynchronizować pliku scrolling text z kioskiem"}), 500
+
+    try:
+        log_conn = get_db_connection()
+        try:
+            create_kiosk_activity_log(
+                conn=log_conn,
+                kiosk_id=kiosk['id'],
+                serial_number=kiosk['serial_number'],
+                level='info',
+                source='backend.scrolling-text-visibility',
+                message='Zmieniono widoczność scrolling text',
+                details={
+                    'direction': 'sent',
+                    'hidden': hidden,
+                    'protocol': sync_result['protocol'],
+                    'port': sync_result['port'],
+                    'path': sync_result['path'],
+                },
+                ip_address=hostname,
+                direction='sent',
+            )
+            log_conn.commit()
+        finally:
+            log_conn.close()
+    except Exception as log_error:
+        print(f"Scrolling text visibility activity log failed: {log_error}")
+
+    return jsonify({
+        'success': True,
+        'message': (
+            f"Scrolling text został ukryty dla kiosku #{kiosk_id}."
+            if hidden
+            else f"Scrolling text został przywrócony dla kiosku #{kiosk_id}."
+        ),
+        'hidden': hidden,
+        'syncProtocol': sync_result['protocol'],
+        'syncPort': sync_result['port'],
+        'syncPath': sync_result['path'],
     })
 
 # =============================================================================
@@ -2567,7 +3848,6 @@ def serve_react_app(filename='index.html'):
     # Fallback SPA: dla tras React Router zwróć index.html.
     return send_from_directory(MY_APP_DIST_PATH, 'index.html')
 
-# ===== REZERWACJE =====
 
 @app.route('/api/reservations/check', methods=['POST'])
 @token_required
@@ -2575,11 +3855,11 @@ def check_reservation():
     """Sprawdzenie dostępności terminu rezerwacji"""
     try:
         data = request.get_json()
-        
+
         # Walidacja danych
         if not data or not all(k in data for k in ['date', 'start_time', 'end_time', 'name']):
             return jsonify({"error": "Brakujące wymagane pola: date, start_time, end_time, name"}), 400
-        
+
         date = data.get('date')
         start_time = data.get('start_time')
         end_time = data.get('end_time')
@@ -3242,4 +4522,8 @@ def admin_change_user_password(user_id):
         return jsonify({"error": f"Błąd serwera: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(
+        debug=parse_bool_env('FLASK_DEBUG', False),
+        host=os.getenv('FLASK_RUN_HOST', '0.0.0.0'),
+        port=parse_int_env('PORT', 5000, min_value=1, max_value=65535),
+    )

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ui } from './uiClasses'
 import { useAsync, useMutation, useFtp, useKiosks } from '../hooks'
 
@@ -7,49 +7,53 @@ export default function TextEditor() {
   const ftpService = useFtp()
 
   const [selectedKioskId, setSelectedKioskId] = useState('')
-  const [filePath, setFilePath] = useState('/storage/napis.txt')
+  const [filePath, setFilePath] = useState('/home/kiosk/napis.txt')
   const [content, setContent] = useState('')
-  const [connection, setConnection] = useState({ hostname: '', username: '', password: '', port: 21 })
+  const [connection, setConnection] = useState({ hostname: '', username: '', password: '', port: 22 })
   const [actionInfo, setActionInfo] = useState('')
 
   const { data: kiosks } = useAsync(() => kioskService.getKiosks())
+
+  const findKioskById = (kioskId) => (kiosks || []).find((kiosk) => kiosk.id === kioskId)
 
   const getDefaultTextPath = (kiosk, port) => {
     const custom = (kiosk?.text_file_path || '').trim()
     if (custom) {
       return custom
     }
-    return Number(port) === 22 ? '/storage/napis.txt' : 'napis.txt'
+    return Number(port) === 22 ? '/home/kiosk/napis.txt' : 'napis.txt'
   }
 
-  useEffect(() => {
-    const kioskId = Number(selectedKioskId)
+  const handleSelectedKioskChange = (nextIdRaw) => {
+    setSelectedKioskId(nextIdRaw)
+
+    const kioskId = Number(nextIdRaw)
     if (!kioskId) {
       return
     }
 
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
     if (!selectedKiosk) {
       return
     }
 
-    setFilePath(getDefaultTextPath(selectedKiosk, Number(connection.port || 21)))
-  }, [selectedKioskId, kiosks])
+    setFilePath(getDefaultTextPath(selectedKiosk, Number(connection.port || 22)))
+  }
 
   const connectMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
     const credentials = await kioskService.getFtpCredentials(kioskId)
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
     const base = {
       hostname: credentials.ip_address || '',
       username: credentials.ftp_username || 'root',
       password: credentials.ftp_password || '',
-      port: 21,
+      port: 22,
       kioskId,
     }
 
     const result = await ftpService.testConnection(base)
-    const resolvedPort = Number(result.port || 21)
+    const resolvedPort = Number(result.port || 22)
     const next = { ...base, port: resolvedPort }
     setConnection(next)
 
@@ -90,7 +94,7 @@ export default function TextEditor() {
 
       <div className={`${ui.card} space-y-4`}>
         <div className="flex flex-wrap items-center gap-2">
-          <select className={`${ui.select} max-w-xs`} value={selectedKioskId} onChange={(event) => setSelectedKioskId(event.target.value)}>
+          <select className={`${ui.select} max-w-xs`} value={selectedKioskId} onChange={(event) => handleSelectedKioskChange(event.target.value)}>
             <option value="">Wybierz kiosk...</option>
             {(kiosks || []).map((kiosk) => (
               <option key={kiosk.id} value={kiosk.id}>{kiosk.name || `Kiosk #${kiosk.id}`}</option>

@@ -10,7 +10,8 @@ import type {
   UpdateKioskRequest,
   KioskRestartServiceRequest,
   KioskRotateDisplayResponse,
-  KioskOrientationFileResponse,
+  GetKioskErrorLogsRequest,
+  GetKioskErrorLogsResponse,
 } from '../types/api'
 
 export class KioskService {
@@ -231,11 +232,21 @@ export class KioskService {
     }
   }
 
-  async writeOrientationFile(kioskId: number, orientation: string): Promise<KioskOrientationFileResponse> {
+  async setScrollingTextVisibility(
+    kioskId: number,
+    hidden: boolean,
+    text?: string
+  ): Promise<{ success: boolean; message: string; hidden: boolean }> {
+    const endpoint = `/api/kiosks/${kioskId}/scrolling-text-visibility`
+    const payload: { hidden: boolean; text?: string } = { hidden }
+    if (typeof text === 'string') {
+      payload.text = text
+    }
+
     try {
-      const result = await this.httpClient.post<KioskOrientationFileResponse>(
-        `/api/kiosks/${kioskId}/orientation-file`,
-        { orientation },
+      const result = await this.httpClient.post<{ success: boolean; message: string; hidden: boolean }>(
+        endpoint,
+        payload,
         { timeout: 20000 }
       )
 
@@ -245,10 +256,33 @@ export class KioskService {
 
       return result
     } catch (error) {
+      if (error instanceof Error && /405|METHOD NOT ALLOWED/i.test(error.message)) {
+        try {
+          const result = await this.httpClient.put<{ success: boolean; message: string; hidden: boolean }>(
+            endpoint,
+            payload,
+            { timeout: 20000 }
+          )
+
+          if (!result) {
+            throw new Error('Invalid response from server')
+          }
+
+          return result
+        } catch (fallbackError) {
+          if (fallbackError instanceof Error) {
+            throw new Error(
+              `${fallbackError.message}. Backend wymaga aktualizacji endpointu scrolling-text-visibility.`
+            )
+          }
+          throw new Error('Backend wymaga aktualizacji endpointu scrolling-text-visibility.')
+        }
+      }
+
       if (error instanceof Error) {
         throw error
       }
-      throw new Error('Błąd zapisu pliku orientacji')
+      throw new Error('Błąd ustawiania widoczności scrolling text')
     }
   }
 
@@ -262,6 +296,36 @@ export class KioskService {
       return String(result?.orientation || 'normal').toLowerCase()
     } catch {
       return 'normal'
+    }
+  }
+
+  async getErrorLogs(filters: GetKioskErrorLogsRequest = {}): Promise<GetKioskErrorLogsResponse> {
+    try {
+      const params = new URLSearchParams()
+      if (typeof filters.kiosk_id === 'number' && Number.isFinite(filters.kiosk_id)) {
+        params.set('kiosk_id', String(filters.kiosk_id))
+      }
+      if (filters.level) {
+        params.set('level', String(filters.level))
+      }
+      if (typeof filters.limit === 'number' && Number.isFinite(filters.limit)) {
+        params.set('limit', String(filters.limit))
+      }
+
+      const query = params.toString()
+      const endpoint = query ? `/api/kiosks/error-logs?${query}` : '/api/kiosks/error-logs'
+      const result = await this.httpClient.get<GetKioskErrorLogsResponse>(endpoint, { timeout: 10000 })
+
+      if (!result || !Array.isArray(result.logs)) {
+        throw new Error('Nieprawidłowa odpowiedź logów błędów kiosków')
+      }
+
+      return result
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error
+      }
+      throw new Error('Błąd pobierania logów błędów kiosków')
     }
   }
 
@@ -322,6 +386,52 @@ export class KioskService {
       return `${diffHours} godzin temu`
     } else {
       return `${diffDays} dni temu`
+    }
+  }
+
+  /**
+   * Log SSH access attempt
+   */
+  async logSshAccess(kioskId: number): Promise<{ success: boolean }> {
+    try {
+      const result = await this.httpClient.post<{ success: boolean }>(
+        `/api/kiosks/${kioskId}/log-ssh-access`,
+        { client: 'browser' },
+        { timeout: 5000 }
+      )
+
+      if (!result || typeof result.success !== 'boolean') {
+        throw new Error('Invalid response')
+      }
+
+      return result
+    } catch (error) {
+      // Silently fail - logging shouldn't break the SSH connection
+      console.warn('Failed to log SSH access:', error)
+      return { success: false }
+    }
+  }
+
+  /**
+   * Log VNC access attempt
+   */
+  async logVncAccess(kioskId: number): Promise<{ success: boolean }> {
+    try {
+      const result = await this.httpClient.post<{ success: boolean }>(
+        `/api/kiosks/${kioskId}/log-vnc-access`,
+        { client: 'browser' },
+        { timeout: 5000 }
+      )
+
+      if (!result || typeof result.success !== 'boolean') {
+        throw new Error('Invalid response')
+      }
+
+      return result
+    } catch (error) {
+      // Silently fail - logging shouldn't break the VNC connection
+      console.warn('Failed to log VNC access:', error)
+      return { success: false }
     }
   }
 }

@@ -5,13 +5,18 @@ services:
       dockerfile: Dockerfile
     container_name: kiosk-backend
     working_dir: /app
+    command: python app.py
     ports:
-      - "0.0.0.0:5000:5000"
+      - "5000:5000"
     volumes:
       - ./backend:/app
       - ./database:/database
     environment:
       - KIOSK_DATABASE_PATH=/database/kiosks.db
+      - PORT=5000
+      - FLASK_RUN_HOST=0.0.0.0
+      - FLASK_DEBUG=0
+    restart: unless-stopped
 
   frontend:
     build:
@@ -19,8 +24,9 @@ services:
       dockerfile: Dockerfile
     container_name: kiosk-frontend
     working_dir: /app
+    command: npm run dev -- --host 0.0.0.0 --port 5173
     ports:
-      - "0.0.0.0:5173:5173"
+      - "5173:5173"
     volumes:
       - ./my-app:/app
       - /app/node_modules
@@ -28,3 +34,4 @@ services:
       - VITE_BACKEND_URL=http://backend:5000
     depends_on:
       - backend
+    restart: unless-stopped

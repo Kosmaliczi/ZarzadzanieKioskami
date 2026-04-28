@@ -35,7 +35,7 @@ export function useAsync<T>(
 
   const [state, setState] = useState<UseAsyncState<T>>({
     data: null,
-    loading: true,
+    loading: !skipInitialLoad,
     error: null,
   })
 
@@ -58,7 +58,11 @@ export function useAsync<T>(
   }, [onError])
 
   const execute = useCallback(async () => {
-    setState({ data: null, loading: true, error: null })
+    setState((previous) => ({
+      ...previous,
+      loading: true,
+      error: null,
+    }))
     retryCountRef.current += 1
 
     try {
@@ -75,15 +79,15 @@ export function useAsync<T>(
       const errorData = handleApiError(error)
 
       if (isMountedRef.current) {
-        setState({
-          data: null,
+        setState((previous) => ({
+          ...previous,
           loading: false,
           error: {
             message: errorData.message,
             code: errorData.code,
             details: errorData.details,
           },
-        })
+        }))
 
         if (onErrorRef.current) {
           onErrorRef.current(error instanceof Error ? error : new Error(errorData.message))

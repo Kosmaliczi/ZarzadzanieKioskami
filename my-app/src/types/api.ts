@@ -68,6 +68,7 @@ export interface Kiosk {
   mac_address: string
   serial_number: string
   ip_address: string | null
+  orientation?: 'normal' | 'right' | 'left' | 'inverted' | string
   ftp_username: string
   ftp_password: string
   media_path?: string | null
@@ -99,6 +100,34 @@ export interface UpdateKioskRequest {
   media_path?: string
   text_file_path?: string
   playlist_target_file?: string
+}
+
+export type KioskErrorLogLevel = 'error' | 'warning' | 'info' | 'debug'
+
+export interface KioskErrorLog {
+  id: number
+  kiosk_id: number
+  kiosk_name?: string | null
+  serial_number?: string | null
+  level: KioskErrorLogLevel
+  source: string
+  message: string
+  details?: unknown
+  direction?: 'sent' | 'received' | 'internal' | null
+  ip_address?: string | null
+  created_at: string
+}
+
+export interface GetKioskErrorLogsRequest {
+  kiosk_id?: number
+  level?: KioskErrorLogLevel
+  limit?: number
+}
+
+export interface GetKioskErrorLogsResponse {
+  success: boolean
+  count: number
+  logs: KioskErrorLog[]
 }
 
 // ============================================================================
@@ -381,19 +410,6 @@ export interface KioskRotateDisplayResponse {
   success: boolean
   message: string
   orientation: string
-  fallbackApplied?: boolean
-  orientationFile?: string
-  orientationFilePort?: number
-  orientationFileError?: string | null
-}
-
-export interface KioskOrientationFileResponse {
-  success: boolean
-  message: string
-  orientation: string
-  orientationFile: string
-  orientationFilePort?: number
-  warning?: string | null
 }
 
 // ============================================================================

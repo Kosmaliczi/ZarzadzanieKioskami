@@ -2,6 +2,12 @@
 
 Kompletna dokumentacja systemu Kiosk Platform obejmująca frontend, backend, bazę danych oraz procesy uruchomieniowe.
 
+## Dokumentacja kioskow RP4 i RP5
+
+Szczegolowa instrukcja pracy z odtwarzaczami kioskowymi znajduje sie w pliku:
+
+- [DOKUMENTACJA_KIOSK_RP4_RP5.md](DOKUMENTACJA_KIOSK_RP4_RP5.md)
+
 ## 1. Cel systemu
 
 Kiosk Platform to aplikacja do centralnego zarządzania kioskami i operacjami serwisowymi.
@@ -149,6 +155,14 @@ Migracje i skrypty pomocnicze:
 
 - `KIOSK_DATABASE_PATH` - ścieżka do pliku bazy SQLite
 - `DATABASE_PATH` - alternatywna nazwa zmiennej dla ścieżki DB
+- `JWT_SECRET_KEY` - sekret podpisywania JWT (wymagany na produkcji)
+- `KIOSK_ENCRYPTION_KEY` - klucz używany przez mechanizm `enc:` dla haseł FTP/SSH
+- `CORS_ALLOWED_ORIGINS` - lista dozwolonych originów dla API, rozdzielona przecinkami
+- `LOGIN_ATTEMPT_LIMIT` - limit błędnych prób logowania w oknie czasowym (domyślnie 5)
+- `LOGIN_ATTEMPT_WINDOW_SECONDS` - okno czasowe dla limitu logowania (domyślnie 300)
+- `LOGIN_LOCKOUT_SECONDS` - czas blokady po przekroczeniu limitu (domyślnie 300)
+- `FLASK_DEBUG` - uruchomienie Flask w trybie debug (domyślnie wyłączone)
+- `PORT` - port backendu (domyślnie 5000)
 - `DJANGO_SETTINGS_MODULE`, `DJANGO_SECRET_KEY`, `DJANGO_DEBUG` - dla warstwy Django
 
 ## 9. Uruchomienie lokalne (zalecane)

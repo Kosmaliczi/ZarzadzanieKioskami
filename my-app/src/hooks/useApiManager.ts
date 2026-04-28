@@ -1,5 +1,5 @@
 /**
- * useApiv Hook and Context
+ * API Hook and Context
  * Provides easy access to API Manager throughout React app
  */
 

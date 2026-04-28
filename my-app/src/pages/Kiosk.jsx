@@ -22,11 +22,14 @@ export default function Kiosk() {
   const [pendingRestartKiosk, setPendingRestartKiosk] = useState(null)
   const [pathSettingsDialog, setPathSettingsDialog] = useState(false)
   const [pathSettingsKiosk, setPathSettingsKiosk] = useState(null)
+  const [scrollingTextHiddenByKiosk, setScrollingTextHiddenByKiosk] = useState({})
   const [pathSettingsForm, setPathSettingsForm] = useState({
     media_path: '',
     text_file_path: '',
     playlist_target_file: '',
   })
+  const [vncModalOpen, setVncModalOpen] = useState(false)
+  const [vncKiosk, setVncKiosk] = useState(null)
 
   const { data: kiosks, loading, error, refetch } = useAsync(() => kioskService.getKiosks())
 
@@ -51,6 +54,12 @@ export default function Kiosk() {
   })
 
   const rotateMutation = useMutation(({ id, orientation }) => kioskService.rotateDisplay(id, orientation), {
+    onSuccess: async () => {
+      await refetch()
+    },
+  })
+
+  const scrollingTextMutation = useMutation(({ id, hidden, text }) => kioskService.setScrollingTextVisibility(id, hidden, text), {
     onSuccess: async () => {
       await refetch()
     },
@@ -154,24 +163,9 @@ export default function Kiosk() {
       return
     }
 
-    if (!kiosk.ftp_password) {
-      setPendingRestartKiosk(kiosk)
-      setSshPasswordInput('')
-      setSshPasswordDialog(true)
-      return
-    }
-
-    try {
-      await restartMutation.execute({
-        id: kiosk.id,
-        username: kiosk.ftp_username || 'root',
-        port: 22,
-        password: kiosk.ftp_password,
-      })
-      setActionInfo(`Wysłano restart usługi dla kiosku #${kiosk.id}`)
-    } catch {
-      // handled by restartMutation.error
-    }
+    setPendingRestartKiosk(kiosk)
+    setSshPasswordInput('')
+    setSshPasswordDialog(true)
   }
 
   const handleConfirmSshPassword = async () => {
@@ -210,6 +204,16 @@ export default function Kiosk() {
       return
     }
 
+    // Log SSH access attempt
+    const logSshAccess = async () => {
+      try {
+        await kioskService.logSshAccess(kiosk.id)
+      } catch (err) {
+        console.error('Błąd logowania dostępu SSH:', err)
+      }
+    }
+    logSshAccess()
+
     const username = kiosk.ftp_username || 'root'
     window.open(`ssh://${username}@${kiosk.ip_address}`, '_blank', 'noopener,noreferrer')
   }
@@ -220,27 +224,54 @@ export default function Kiosk() {
       return
     }
 
-    window.open(`http://${kiosk.ip_address}:6080`, '_blank', 'noopener,noreferrer')
+    // Log VNC access attempt
+    const logVncAccess = async () => {
+      try {
+        await kioskService.logVncAccess(kiosk.id)
+      } catch (err) {
+        console.error('Błąd logowania dostępu VNC:', err)
+      }
+    }
+    logVncAccess()
+
+    setVncKiosk(kiosk)
+    setVncModalOpen(true)
   }
 
   const handleRotate = async (kiosk) => {
-    const currentOrientation = await kioskService.getTickerOrientation()
+    const currentOrientation = String(kiosk.orientation || 'normal').trim().toLowerCase()
     const nextOrientation = currentOrientation === 'right' ? 'normal' : 'right'
 
     try {
-      const fileResult = await kioskService.writeOrientationFile(kiosk.id, nextOrientation)
-      if (fileResult.orientationFilePort) {
-        setActionInfo(`Zmieniono orientację na ${nextOrientation} i zapisano w ${fileResult.orientationFile} (${fileResult.orientationFilePort})`)
-      } else {
-        setActionInfo(`Nie zapisano pliku na kiosku: ${fileResult.warning || 'brak połączenia z kioskiem'}`)
-      }
+      await rotateMutation.execute({ id: kiosk.id, orientation: nextOrientation })
+      setActionInfo(`Wysłano obrót ekranu na ${nextOrientation} dla kiosku #${kiosk.id}`)
     } catch {
-      try {
-        await rotateMutation.execute({ id: kiosk.id, orientation: nextOrientation })
-        setActionInfo(`Wysłano obrót ekranu na ${nextOrientation} dla kiosku #${kiosk.id}`)
-      } catch {
-        // handled by rotateMutation.error / service error state
-      }
+      // handled by rotateMutation.error / service error state
+    }
+  }
+
+  const handleToggleScrollingText = async (kiosk) => {
+    const currentlyHidden = Boolean(scrollingTextHiddenByKiosk[kiosk.id])
+    const nextHidden = !currentlyHidden
+
+    try {
+      await scrollingTextMutation.execute({
+        id: kiosk.id,
+        hidden: nextHidden,
+      })
+
+      setScrollingTextHiddenByKiosk((prev) => ({
+        ...prev,
+        [kiosk.id]: nextHidden,
+      }))
+
+      setActionInfo(
+        nextHidden
+          ? `Ukryto scrolling text dla kiosku #${kiosk.id}`
+          : `Przywrócono scrolling text dla kiosku #${kiosk.id}`
+      )
+    } catch {
+      // handled by scrollingTextMutation.error
     }
   }
 
@@ -309,6 +340,7 @@ export default function Kiosk() {
       {updateMutation.error ? <p className="text-sm text-red-600">{updateMutation.error.message}</p> : null}
       {restartMutation.error ? <p className="text-sm text-red-600">{restartMutation.error.message}</p> : null}
       {rotateMutation.error ? <p className="text-sm text-red-600">{rotateMutation.error.message}</p> : null}
+      {scrollingTextMutation.error ? <p className="text-sm text-red-600">{scrollingTextMutation.error.message}</p> : null}
       {deleteMutation.error ? <p className="text-sm text-red-600">{deleteMutation.error.message}</p> : null}
       {actionInfo ? <p className="text-sm text-blue-700">{actionInfo}</p> : null}
 
@@ -322,6 +354,7 @@ export default function Kiosk() {
               <th className={ui.th}>S/N</th>
               <th className={ui.th}>IP</th>
               <th className={ui.th}>Status</th>
+              <th className={ui.th}>Obrót</th>
               <th className={ui.th}>Ostatnie połączenie</th>
               <th className={ui.th}>Akcje</th>
             </tr>
@@ -369,6 +402,7 @@ export default function Kiosk() {
                     {kiosk.status}
                   </span>
                 </td>
+                <td className={ui.td}>{kiosk.orientation || 'normal'}</td>
                 <td className={ui.td}>{kiosk.last_connection || '-'}</td>
                 <td className={ui.td}>
                   <div className="flex flex-wrap gap-2">
@@ -398,6 +432,15 @@ export default function Kiosk() {
                         <button className={ui.btn} onClick={() => handleRotate(kiosk)} disabled={rotateMutation.loading}>
                           Obróć
                         </button>
+                        <button
+                          className={ui.btn}
+                          onClick={() => handleToggleScrollingText(kiosk)}
+                          disabled={scrollingTextMutation.loading}
+                        >
+                          {scrollingTextMutation.loading
+                            ? 'Zapisywanie...'
+                            : (scrollingTextHiddenByKiosk[kiosk.id] ? 'Pokaż napis' : 'Schowaj napis')}
+                        </button>
                         <button className={ui.btn} onClick={() => handleOpenPathSettings(kiosk)}>
                           Ścieżki
                         </button>
@@ -412,7 +455,7 @@ export default function Kiosk() {
             ))}
             {rows.length === 0 ? (
               <tr>
-                <td className={ui.td} colSpan={8}>Brak kiosków</td>
+                <td className={ui.td} colSpan={9}>Brak kiosków</td>
               </tr>
             ) : null}
           </tbody>
@@ -499,6 +542,35 @@ export default function Kiosk() {
               </button>
               <button className={ui.btnSecondary} onClick={handleClosePathSettings}>
                 Anuluj
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {vncModalOpen ? (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full p-6 flex flex-col h-[80vh]">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-semibold">VNC - {vncKiosk?.name || `Kiosk #${vncKiosk?.id}`}</h3>
+              <button
+                onClick={() => setVncModalOpen(false)}
+                className="text-gray-500 hover:text-gray-700 text-2xl leading-none"
+              >
+                ×
+              </button>
+            </div>
+            <div className="flex-1 bg-gray-100 rounded border border-gray-300 overflow-hidden">
+              <iframe
+                src={`http://${vncKiosk?.ip_address}:6080/vnc.html`}
+                title="VNC"
+                className="w-full h-full border-none"
+                sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+              />
+            </div>
+            <div className="flex gap-3 pt-4">
+              <button className={ui.btnSecondary} onClick={() => setVncModalOpen(false)}>
+                Zamknij
               </button>
             </div>
           </div>

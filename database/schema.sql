@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS kiosks (
     mac_address VARCHAR(20) NOT NULL UNIQUE,
     serial_number VARCHAR(30) NOT NULL UNIQUE,
     ip_address VARCHAR(15),
+    orientation VARCHAR(20) NOT NULL DEFAULT 'normal',
     last_connection DATETIME,
     status VARCHAR(20) DEFAULT 'offline',
     name VARCHAR(100),
@@ -17,6 +18,22 @@ CREATE TABLE IF NOT EXISTS kiosks (
 
 CREATE INDEX IF NOT EXISTS idx_kiosks_mac ON kiosks(mac_address);
 CREATE INDEX IF NOT EXISTS idx_kiosks_serial ON kiosks(serial_number);
+
+CREATE TABLE IF NOT EXISTS kiosk_error_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kiosk_id INTEGER NOT NULL,
+    serial_number VARCHAR(30),
+    level VARCHAR(20) NOT NULL DEFAULT 'error',
+    source VARCHAR(120) NOT NULL DEFAULT 'device',
+    message TEXT NOT NULL,
+    details TEXT,
+    ip_address VARCHAR(45),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(kiosk_id) REFERENCES kiosks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_kiosk_error_logs_kiosk_created ON kiosk_error_logs(kiosk_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_kiosk_error_logs_created ON kiosk_error_logs(created_at);
 
 -- Tabela ustawień aplikacji
 CREATE TABLE IF NOT EXISTS settings (

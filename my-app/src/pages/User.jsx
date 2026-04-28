@@ -71,7 +71,7 @@ export default function User() {
   const handlePermissionToggle = (actionKey) => {
     setPermissionsDraft((prev) => ({
       ...prev,
-      [actionKey]: !Boolean(prev[actionKey]),
+      [actionKey]: !prev[actionKey],
     }))
   }
 

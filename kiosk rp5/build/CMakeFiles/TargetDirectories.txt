@@ -1,0 +1,3 @@
+/home/kiosk/build/CMakeFiles/video_player.dir
+/home/kiosk/build/CMakeFiles/edit_cache.dir
+/home/kiosk/build/CMakeFiles/rebuild_cache.dir

@@ -4,7 +4,6 @@
  */
 
 import type {
-  ApiResponse,
   ApiError,
   RequestConfig,
   RequestConfigInternal,
@@ -129,7 +128,7 @@ export class HttpClient {
           method,
           headers,
           data,
-          timeout: this.timeout,
+          timeout: requestConfig.timeout ?? this.timeout,
           validateStatus: () => true,
         })
 
@@ -173,19 +172,18 @@ export class HttpClient {
           lastError = interceptor(lastError)
         }
 
-        // Don't retry on client errors (4xx) or if skip error handling
+        // Don't retry on client errors (4xx).
         if (lastError.status >= 400 && lastError.status < 500) {
           throw lastError
         }
 
-        // Retry with exponential backoff
-        if (attempt < this.retries) {
-          const delay = this.retryDelay * Math.pow(2, attempt)
-          await new Promise((resolve) => setTimeout(resolve, delay))
-          continue
+        // Retry with exponential backoff only for safe/idempotent requests.
+        if (!this.shouldRetryRequest(method, lastError) || attempt >= this.retries) {
+          throw lastError
         }
 
-        throw lastError
+        const delay = this.retryDelay * Math.pow(2, attempt)
+        await new Promise((resolve) => setTimeout(resolve, delay))
       }
     }
 
@@ -255,6 +253,21 @@ export class HttpClient {
   }
 
   /**
+   * Retry only idempotent requests and transient failures.
+   */
+  private shouldRetryRequest(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', error: ApiError): boolean {
+    if (method !== 'GET') {
+      return false
+    }
+
+    if (!error.status || error.code === 'TIMEOUT' || error.code === 'NETWORK_ERROR') {
+      return true
+    }
+
+    return error.status >= 500
+  }
+
+  /**
    * Get auth token from storage
    */
   private getAuthToken(): string | null {
@@ -270,7 +283,7 @@ export class HttpClient {
         return null
       }
 
-      return value
+      return typeof value === 'string' && value ? value : null
     } catch {
       return null
     }
@@ -293,23 +306,6 @@ export function createHttpClient(baseUrl: string = API_BASE_URL): HttpClient {
     timeout: 30000,
     retries: 3,
     retryDelay: 1000,
-  })
-
-  // Add auth interceptor
-  client.addRequestInterceptor((config) => {
-    const token = localStorage.getItem('authToken')
-    if (token) {
-      try {
-        const { value } = JSON.parse(token)
-        if (!config.headers) {
-          config.headers = {}
-        }
-        config.headers['Authorization'] = `Bearer ${value}`
-      } catch {
-        // Invalid token format, ignore
-      }
-    }
-    return config
   })
 
   // Add error handling interceptor

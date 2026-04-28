@@ -5,6 +5,7 @@ import axios from 'axios'
 vi.mock('axios', () => ({
   default: {
     request: vi.fn(),
+    isAxiosError: vi.fn(() => false),
   },
 }))
 
@@ -33,6 +34,44 @@ describe('core/HttpClient segment', () => {
     await client.get('/api/kiosks', { cache: true, cacheTime: 60000 })
     await client.get('/api/kiosks', { cache: true, cacheTime: 60000 })
 
+    expect(axios.request).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not add authorization header when skipAuth is true', async () => {
+    localStorage.setItem('authToken', JSON.stringify({ value: 'abc123', expiresAt: Date.now() + 60000 }))
+    axios.request.mockResolvedValue({ status: 200, data: { success: false } })
+
+    const client = createHttpClient('http://localhost:5000')
+    await client.post('/api/auth/login', { username: 'admin', password: 'x' }, { skipAuth: true })
+
+    const options = axios.request.mock.calls[0][0]
+    expect(options.headers.Authorization).toBeUndefined()
+  })
+
+  it('uses request-level timeout override', async () => {
+    axios.request.mockResolvedValue({ status: 200, data: { ok: true } })
+
+    const client = createHttpClient('http://localhost:5000')
+    await client.get('/api/kiosks', { timeout: 1234 })
+
+    const options = axios.request.mock.calls[0][0]
+    expect(options.timeout).toBe(1234)
+  })
+
+  it('retries transient GET failures but not POST', async () => {
+    axios.request
+      .mockRejectedValueOnce(new Error('temporary network error'))
+      .mockResolvedValueOnce({ status: 200, data: { ok: true } })
+
+    const client = createHttpClient('http://localhost:5000')
+    const getResult = await client.get('/api/kiosks')
+    expect(getResult).toEqual({ ok: true })
+    expect(axios.request).toHaveBeenCalledTimes(2)
+
+    axios.request.mockReset()
+    axios.request.mockRejectedValueOnce(new Error('temporary network error'))
+
+    await expect(client.post('/api/auth/login', { username: 'x', password: 'y' })).rejects.toThrow('temporary network error')
     expect(axios.request).toHaveBeenCalledTimes(1)
   })
 })

@@ -4,6 +4,7 @@ import { render, screen } from '@testing-library/react'
 vi.mock('../src/pages/Dashboard', () => ({ default: () => <div>DashboardPage</div> }))
 vi.mock('../src/pages/Ftp', () => ({ default: () => <div>FtpPage</div> }))
 vi.mock('../src/pages/Kiosk', () => ({ default: () => <div>KioskPage</div> }))
+vi.mock('../src/pages/KioskErrorLogs', () => ({ default: () => <div>KioskErrorLogsPage</div> }))
 vi.mock('../src/pages/Playlist', () => ({ default: () => <div>PlaylistPage</div> }))
 vi.mock('../src/pages/Reservation', () => ({ default: () => <div>ReservationPage</div> }))
 vi.mock('../src/pages/Settings', () => ({ default: () => <div>SettingsPage</div> }))

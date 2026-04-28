@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ui } from './uiClasses'
 import { useAsync, useMutation, useFtp, useKiosks, usePlaylists } from '../hooks'
 
@@ -33,26 +33,30 @@ export default function Playlist() {
     return `${mediaPath || '/storage/videos'}/kiosk_playlist.m3u`
   }
 
-  const { data: kiosks } = useAsync(() => kioskService.getKiosks())
+  const findKioskById = (kioskId) => (kiosks || []).find((kiosk) => kiosk.id === kioskId)
 
-  useEffect(() => {
-    const kioskId = Number(selectedKioskId)
+  const handleSelectedKioskChange = (nextIdRaw) => {
+    setSelectedKioskId(nextIdRaw)
+
+    const kioskId = Number(nextIdRaw)
     if (!kioskId) {
       return
     }
 
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
     if (!selectedKiosk) {
       return
     }
 
     setTargetFile(getDefaultTargetFile(selectedKiosk, Number(connection.port || 21)))
-  }, [selectedKioskId, kiosks])
+  }
+
+  const { data: kiosks } = useAsync(() => kioskService.getKiosks())
 
   const loadFilesMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
     const credentials = await kioskService.getFtpCredentials(kioskId)
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
 
     const baseConnection = {
       hostname: credentials.ip_address || '',
@@ -67,6 +71,18 @@ export default function Playlist() {
     const nextConnection = { ...baseConnection, port: resolvedPort }
     setConnection(nextConnection)
 
+    setTargetFile((currentTargetFile) => {
+      const normalizedCurrent = String(currentTargetFile || '').trim()
+      const default21 = getDefaultTargetFile(selectedKiosk, 21)
+      const default22 = getDefaultTargetFile(selectedKiosk, 22)
+
+      if (!normalizedCurrent || normalizedCurrent === default21 || normalizedCurrent === default22) {
+        return getDefaultTargetFile(selectedKiosk, resolvedPort)
+      }
+
+      return currentTargetFile
+    })
+
     const mediaPath = getDefaultMediaPath(selectedKiosk, resolvedPort)
 
     const result = await ftpService.listFiles({
@@ -77,14 +93,14 @@ export default function Playlist() {
 
     const onlyFiles = (result.files || []).filter((file) => file.type !== 'directory')
     setAvailableFiles(onlyFiles)
-    setActionInfo(`Załadowano ${onlyFiles.length} plików z kiosku (${mediaPath})`) 
+    setActionInfo(`Załadowano ${onlyFiles.length} plików z kiosku (${mediaPath})`)
 
     return result
   })
 
   const loadPlaylistMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
     const result = await playlistService.getKioskPlaylist(kioskId, playlistName)
     setPlaylistItems(result.items || [])
     setOrderMode(result.playlist?.order_mode || 'manual')
@@ -95,7 +111,7 @@ export default function Playlist() {
 
   const savePlaylistMutation = useMutation(async () => {
     const kioskId = Number(selectedKioskId)
-    const selectedKiosk = (kiosks || []).find((kiosk) => kiosk.id === kioskId)
+    const selectedKiosk = findKioskById(kioskId)
     const resolvedTargetFile = targetFile.trim() || getDefaultTargetFile(selectedKiosk, Number(connection.port || 21))
     const payload = {
       name: playlistName,
@@ -174,7 +190,7 @@ export default function Playlist() {
       </div>
 
       <div className={`${ui.card} grid gap-3 md:grid-cols-3`}>
-        <select className={ui.select} value={selectedKioskId} onChange={(event) => setSelectedKioskId(event.target.value)}>
+        <select className={ui.select} value={selectedKioskId} onChange={(event) => handleSelectedKioskChange(event.target.value)}>
           <option value="">Wybierz kiosk...</option>
           {(kiosks || []).map((kiosk) => (
             <option key={kiosk.id} value={kiosk.id}>{kiosk.name || `Kiosk #${kiosk.id}`}</option>
